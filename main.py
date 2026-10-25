@@ -23,10 +23,22 @@ HTML_CONTENT = """
         .card:hover { background: #0284c7; color: white; border-color: #0284c7; transform: translateY(-3px); }
         .section-title { font-size: 18px; font-weight: bold; margin: 20px 0 10px 0; color: #0f172a; border-right: 4px solid #0284c7; padding-right: 8px; }
         .hidden { display: none; }
-        input[type="text"], input[type="file"] { width: 100%; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box; margin-bottom: 15px; }
+        input[type="text"], input[type="file"], input[type="number"] { width: 100%; padding: 12px; border: 1px solid #cbd5e1; border-radius: 8px; box-sizing: border-box; margin-bottom: 15px; }
         button { width: 100%; padding: 12px; background-color: #10b981; color: white; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; font-size: 16px; }
         button:hover { background-color: #059669; }
-        .result-box { margin-top: 25px; padding: 20px; background: #f8fafc; border-radius: 12px; border-right: 5px solid #0284c7; border: 1px solid #e2e8f0; display: none; }
+        
+        /* صندوق النتائج مع إطار أحمر وبارز */
+        .result-box { 
+            margin-top: 25px; 
+            padding: 20px; 
+            background: #fef2f2; 
+            border-radius: 12px; 
+            border: 3px solid #ef4444; 
+            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.15);
+            display: none; 
+        }
+        .result-box h4 { color: #dc2626; margin-top: 0; }
+        
         .lang-switch { text-align: left; margin-bottom: 15px; }
         .lang-btn { background: #64748b; padding: 5px 15px; font-size: 14px; width: auto; display: inline-block; }
     </style>
@@ -64,20 +76,20 @@ HTML_CONTENT = """
     <div id="step3" class="hidden">
         <div class="section-title" id="selectedTitle">خيارات الكتاب:</div>
         <div class="grid">
-            <div class="card" onclick="alert('جاري فتح الكتاب بدون حل... / Opening clean book...')">📖 الكتاب بدون حل / Clean Book</div>
-            <div class="card" onclick="alert('جاري فتح الكتاب محلول... / Opening solved book...')">📝 الكتاب محلول / Answered Book</div>
-            <div class="card" onclick="alert('جاري فتح شرح الدروس... / Opening lessons explanations...')">👨‍🏫 شرح الدروس / Lessons Explanations</div>
+            <div class="card" onclick="alert('جاري فتح الكتاب بدون حل...')">📖 الكتاب بدون حل / Clean Book</div>
+            <div class="card" onclick="alert('جاري فتح الكتاب محلول...')">📝 الكتاب محلول / Answered Book</div>
+            <div class="card" onclick="alert('جاري فتح شرح الدروس...')">👨‍🏫 شرح الدروس / Lessons Explanations</div>
             <div class="card" onclick="showAiSearch()" style="background: #e0f2fe; border-color: #7dd3fc;">🤖 الكتاب بمساعدة الذكاء الاصطناعي / AI Textbook Assistant</div>
         </div>
         <button onclick="goBack(2)" style="background: #64748b; margin-top: 10px;">⬅ رجوع / Back</button>
     </div>
 
-    <!-- الخطوة 4: قسم الذكاء الاصطناعي والبحث وتظليل الإجابات -->
+    <!-- الخطوة 4: قسم الذكاء الاصطناعي والبحث -->
     <div id="aiSection" class="hidden" style="margin-top: 30px; border-top: 2px dashed #cbd5e1; padding-top: 20px;">
-        <h3 style="color: #0284c7;">🤖 البحث الذكي واستخراج الإجابات / AI Smart Search</h3>
+        <h3 style="color: #0284c7;">🤖 البحث الذكي وتحديد الإجابة من الكتاب / AI Smart Search</h3>
         
         <div style="margin-bottom: 15px;">
-            <label style="font-weight: bold; display: block; margin-bottom: 5px;">رفـع ملف الـ PDF الخاص بالمادة (يدعم الكتب الكاملة):</label>
+            <label style="font-weight: bold; display: block; margin-bottom: 5px;">رفع ملف الـ PDF الخاص بالمادة:</label>
             <input type="file" id="pdfFile" accept=".pdf">
             <button onclick="uploadBook()">رفع ومعالجة الكتاب / Upload & Process Book</button>
         </div>
@@ -88,16 +100,21 @@ HTML_CONTENT = """
         </div>
 
         <div style="margin-bottom: 15px;">
+            <label style="font-weight: bold; display: block; margin-bottom: 5px;">رقم صفحة الكتاب الفعلية (إذا كان هناك فارق عن ملف الـ PDF، وإلا اتركه 0):</label>
+            <input type="number" id="pageOffset" value="0" placeholder="مثال: الفرق بين صفحة الملف وصفحة الكتاب">
+        </div>
+
+        <div style="margin-bottom: 15px;">
             <label style="font-weight: bold; display: block; margin-bottom: 5px;">اكتب سؤالك أو ما تريد البحث عنه:</label>
-            <input type="text" id="query" placeholder="مثال: قانون نيوتن / Newton Law...">
+            <input type="text" id="query" placeholder="مثال: قانون الجذب الكوني...">
         </div>
 
         <button onclick="searchBook()" style="background: #0284c7;">بحث ذكي وتحديد الإجابة 🔍 / AI Search</button>
 
         <div id="resultBox" class="result-box">
-            <h4>📌 النتيجة المستخرجة من الكتاب / Extracted Result:</h4>
-            <p id="answerText"></p>
-            <p id="pageText" style="font-weight: bold; color: #e11d48;"></p>
+            <h4>📌 الإجابة المحددة من الكتاب داخل الإطار الأحمر:</h4>
+            <p id="answerText" style="font-size: 16px; font-weight: bold; line-height: 1.6;"></p>
+            <p id="pageText" style="font-weight: bold; color: #dc2626; font-size: 17px; background: #fee2e2; padding: 8px; border-radius: 6px; display: inline-block;"></p>
         </div>
     </div>
 </div>
@@ -114,7 +131,7 @@ function selectStage(stage) {
 
 function selectSubject(subject) {
     currentSubject = subject;
-    document.getElementById('selectedTitle').innerText = `المرحلة / Stage: ${currentStage} | المادة / Subject: ${currentSubject}`;
+    document.getElementById('selectedTitle').innerText = `المرحلة: ${currentStage} | المادة: ${currentSubject}`;
     document.getElementById('step2').classList.add('hidden');
     document.getElementById('step3').classList.remove('hidden');
 }
@@ -142,7 +159,7 @@ async function uploadBook() {
     const formData = new FormData();
     formData.append('file', fileInput.files[0]);
     
-    alert('جاري رفع ومعالجة الكتاب الكامل... قد يأخذ بضع ثوانٍ');
+    alert('جاري رفع ومعالجة الكتاب الكامل...');
     const res = await fetch('/upload-book/', { method: 'POST', body: formData });
     const data = await res.json();
     alert(data.message);
@@ -152,20 +169,23 @@ async function uploadBook() {
 async function searchBook() {
     const bookName = document.getElementById('bookName').value;
     const query = document.getElementById('query').value;
+    const offset = parseInt(document.getElementById('pageOffset').value) || 0;
+    
     if (!bookName || !query) { alert('الرجاء إدخال اسم الكتاب والسؤال بدقة'); return; }
 
-    const res = await fetch(`/search-book/?book_name=${encodeURIComponent(bookName)}&query=${encodeURIComponent(query)}`, { method: 'POST' });
+    const res = await fetch(`/search-book/?book_name=${encodeURIComponent(bookName)}&query=${encodeURIComponent(query)}&offset=${offset}`, { method: 'POST' });
     const data = await res.json();
     
     const resultBox = document.getElementById('resultBox');
     resultBox.style.display = 'block';
     
     if(data.error) {
+        document.getElementById('answerText انعكاس').innerText = "";
         document.getElementById('answerText').innerText = data.error;
         document.getElementById('pageText').innerText = "";
     } else {
-        document.getElementById('answerText').innerText = "النص المطابق: " + data.extracted_text;
-        document.getElementById('pageText').innerText = `📄 تم العثور على المعلومة في الصفحة رقم: ${data.page_number}`;
+        document.getElementById('answerText').innerText = "النص المستخرج: " + data.extracted_text;
+        document.getElementById('pageText').innerText = `📄 رقم الصفحة الفعلية في الكتاب: ${data.page_number}`;
     }
 }
 
@@ -175,14 +195,10 @@ function toggleLanguage() {
         html.setAttribute('dir', 'ltr');
         html.setAttribute('lang', 'en');
         document.getElementById('mainHeading').innerText = "🎓 Smart Curriculum Educational Platform";
-        document.getElementById('t1').innerText = "Select your academic stage:";
-        document.getElementById('t2').innerText = "Select your subject:";
     } else {
         html.setAttribute('dir', 'rtl');
         html.setAttribute('lang', 'ar');
         document.getElementById('mainHeading').innerText = "🎓 منصة المنهج الذكي التعليمية";
-        document.getElementById('t1').innerText = "اختر مرحلتك الدراسية:";
-        document.getElementById('t2').innerText = "اختر المادة الدراسية:";
     }
 }
 </script>
@@ -199,10 +215,10 @@ async def upload_book(file: UploadFile = File(...)):
     file_path = f"books/{file.filename}"
     with open(file_path, "wb") as f:
         f.write(await file.read())
-    return {"status": "success", "message": f"تم رفع ومعالجة كتاب {file.filename} بنجاح!"}
+    return {"status": "success", "message": f"تم رفع كتاب {file.filename} بنجاح!"}
 
 @app.post("/search-book/")
-async def search_book(book_name: str, query: str):
+async def search_book(book_name: str, query: str, offset: int = 0):
     pdf_path = f"books/{book_name}"
     if not os.path.exists(pdf_path):
         return {"error": "لم يتم العثور على ملف الكتاب، تأكد من رفعه بشكل صحيح."}
@@ -216,8 +232,9 @@ async def search_book(book_name: str, query: str):
         text = page.extract_text() or ""
         matches = sum(1 for kw in keywords if kw in text)
         if matches > 0:
-            found_page = page_num + 1
-            matched_text = text[:400].replace("\n", " ")
+            # حساب رقم الصفحة الفعلي مع الأخذ بعين الاعتبار الفارق (Offset)
+            found_page = (page_num + 1) + offset
+            matched_text = text[:450].replace("\n", " ")
             break
             
     if not matched_text:

@@ -1,5 +1,4 @@
 fastapi
 uvicorn
-pydantic
-pypdf
-python-multipart
+pymupdf
+google-generativeai

@@ -8,7 +8,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# تم وضع مفتاحك الخاص مباشرة هنا ليعمل التطبيق بدون أي أخطاء
+GEMINI_API_KEY = "AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg"
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -676,7 +678,6 @@ def index():
         const termsGrid = document.getElementById('terms-grid');
         termsGrid.innerHTML = '';
         
-        // فصلين دراسيين فقط
         [1, 2].forEach(term => {
             const btn = document.createElement('div');
             btn.className = 'btn-card';

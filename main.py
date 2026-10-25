@@ -1,581 +1,683 @@
 import os
-from pypdf import PdfReader
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, FileResponse
+import io
+import fitz  # PyMuPDF
+import base64
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import google.generativeai as genai
 
-app = FastAPI()
+# إعداد مفتاح API الخاص بـ Gemini
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
-os.makedirs("books", exist_ok=True)
+app = FastAPI(title="Smart Curriculum Educational Platform")
 
-HTML_CONTENT = """
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BOOKS_DIR = os.path.join(os.path.dirname(__file__), "books")
+
+def get_gemini_model():
+    return genai.GenerativeModel('gemini-1.5-flash')
+
+def search_pdf_text(pdf_path: str, query: str):
+    doc = fitz.open(pdf_path)
+    keywords = [k.strip() for k in query.split() if len(k.strip()) > 2]
+    matched_pages = []
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        text = page.get_text("text")
+        score = 0
+        for kw in keywords:
+            if kw.lower() in text.lower():
+                score += 1
+        if score > 0:
+            matched_pages.append((page_idx, score))
+
+    matched_pages.sort(key=lambda x: x[1], reverse=True)
+    return [p[0] for p in matched_pages[:3]] if matched_pages else [0]
+
+def render_page_with_highlight(doc: fitz.Document, page_num: int, highlight_text: str = "") -> str:
+    page = doc[page_num]
+    if highlight_text:
+        text_instances = page.search_for(highlight_text)
+        for inst in text_instances:
+            # إضافة إبراز أحمر ناصع حول النص المحدد
+            page.draw_rect(inst, color=(1, 0, 0), fill=(1, 0.8, 0.8), overlay=True)
+
+    pix = page.get_pixmap(dpi=150)
+    img_bytes = pix.tobytes("png")
+    encoded = base64.b64encode(img_bytes).decode('utf-8')
+    return f"data:image/png;base64,{encoded}"
+
+@app.get("/api/search")
+def search_in_book(book_code: str = Query(...), query: str = Query(...)):
+    filename = f"{book_code}.pdf"
+    pdf_path = os.path.join(BOOKS_DIR, filename)
+
+    if not os.path.exists(pdf_path):
+        return JSONResponse(
+            status_code=404,
+            content={"error_ar": "عذراً، الكتاب غير متوفر حالياً في المكتبة الرقمية.",
+                      "error_en": "Sorry, this book is currently not available in the library."}
+        )
+
+    try:
+        doc = fitz.open(pdf_path)
+        top_pages = search_pdf_text(pdf_path, query)
+        best_page_idx = top_pages[0]
+        page = doc[best_page_idx]
+
+        pix = page.get_pixmap(dpi=150)
+        img_bytes = pix.tobytes("png")
+
+        model = get_gemini_model()
+        prompt = (
+            f"أنت معلم وخبير في المناهج الدراسية. بناءً على صفحة الكتاب المرفقة، أجب بدقة على السؤال التالي: '{query}'.\n"
+            f"إذا وجدت الإجابة في الصفحة، حدد النص الدقيق المستخرج للإجابة في السطر الأخير مسبوقاً بـ 'EXACT_TEXT:'."
+        )
+
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "image/png", "data": img_bytes}
+        ])
+
+        answer_text = response.text if response.text else "لم يتم العثور على إجابة واضحة."
+        highlight_str = ""
+        if "EXACT_TEXT:" in answer_text:
+            parts = answer_text.split("EXACT_TEXT:")
+            answer_text = parts[0].strip()
+            highlight_str = parts[1].strip()
+
+        img_b64 = render_page_with_highlight(doc, best_page_idx, highlight_str)
+
+        return {
+            "page_number": best_page_idx + 1,
+            "answer": answer_text,
+            "highlight": highlight_str,
+            "page_image": img_b64
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/custom-pdf-search")
+async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)):
+    if not file.filename.endswith('.pdf'):
+        return JSONResponse(status_code=400, content={"error": "يجب أن يكون الملف بصيغة PDF فقط."})
+    
+    try:
+        contents = await file.read()
+        doc = fitz.open(stream=contents, filetype="pdf")
+        
+        # البحث في أفضل صفحة مطابقة
+        keywords = [k.strip() for k in query.split() if len(k.strip()) > 2]
+        best_page_idx = 0
+        max_score = -1
+
+        for page_idx in range(len(doc)):
+            text = doc[page_idx].get_text("text")
+            score = sum(1 for kw in keywords if kw.lower() in text.lower())
+            if score > max_score:
+                max_score = score
+                best_page_idx = page_idx
+
+        page = doc[best_page_idx]
+        pix = page.get_pixmap(dpi=150)
+        img_bytes = pix.tobytes("png")
+
+        model = get_gemini_model()
+        prompt = (
+            f"بناءً على صفحة المستند المرفقة، أجب على السؤال التالي: '{query}'.\n"
+            f"في نهاية إجابتك أضف سطر جديد مكتوب فيه EXACT_TEXT: متبوعاً بالجملة أو النص الدقيق المحدد للإجابة من الصفحة."
+        )
+
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "image/png", "data": img_bytes}
+        ])
+
+        answer_text = response.text if response.text else "تم تحليله بنجاح."
+        highlight_str = ""
+        if "EXACT_TEXT:" in answer_text:
+            parts = answer_text.split("EXACT_TEXT:")
+            answer_text = parts[0].strip()
+            highlight_str = parts[1].strip()
+
+        img_b64 = render_page_with_highlight(doc, best_page_idx, highlight_str)
+
+        return {
+            "page_number": best_page_idx + 1,
+            "answer": answer_text,
+            "page_image": img_b64
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    html_content = """
 <!DOCTYPE html>
 <html lang="ar" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>منصة المنهج الذكي | Smart Curriculum Platform</title>
+    <title>المنصة التعليمية الذكية - Smart Curriculum Platform</title>
+    <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&display=swap" rel="stylesheet">
     <style>
         :root {
+            --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #311042 100%);
+            --card-bg: rgba(255, 255, 255, 0.92);
             --primary: #4f46e5;
             --primary-hover: #4338ca;
-            --accent-glow: rgba(79, 70, 229, 0.3);
-            --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #312e81 100%);
-            --card-bg: rgba(255, 255, 255, 0.95);
-            --text-main: #0f172a;
-            --text-muted: #475569;
-            --border-color: rgba(226, 232, 240, 0.8);
-            --accent-red: #f43f5e;
-            --accent-green: #10b981;
+            --secondary: #06b6d4;
+            --accent-red: #ef4444;
+            --text-dark: #1e293b;
         }
 
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Tajawal', sans-serif;
             background: var(--bg-gradient);
-            color: var(--text-main);
-            margin: 0;
-            padding: 20px;
             min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
+            margin: 0;
+            padding: 20px 10px;
+            color: var(--text-dark);
         }
 
         .container {
-            width: 100%;
-            max-width: 950px;
-            background: rgba(255, 255, 255, 0.92);
-            backdrop-filter: blur(20px);
-            padding: 40px;
-            border-radius: 28px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
-            border: 1px solid rgba(255, 255, 255, 0.5);
-            position: relative;
-            overflow: hidden;
-            box-sizing: border-box;
+            max-width: 900px;
+            margin: 0 auto;
+            background: var(--card-bg);
+            border-radius: 24px;
+            padding: 30px 20px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+            backdrop-filter: blur(10px);
         }
 
-        .container::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            right: 0;
-            width: 100%;
-            height: 6px;
-            background: linear-gradient(90deg, #4f46e5, #06b6d4, #10b981);
-        }
-
-        .header-flex {
+        .header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             border-bottom: 2px solid #e2e8f0;
-            padding-bottom: 20px;
-            margin-bottom: 30px;
-        }
-
-        h2 {
-            color: var(--primary);
-            margin: 0;
-            font-size: 28px;
-            font-weight: 800;
-            letter-spacing: -0.5px;
-        }
-
-        .lang-btn {
-            background: #f1f5f9;
-            color: var(--text-muted);
-            border: 1px solid #cbd5e1;
-            padding: 8px 16px;
-            border-radius: 10px;
-            cursor: pointer;
-            font-weight: 700;
-            transition: all 0.3s ease;
-        }
-
-        .lang-btn:hover {
-            background: var(--primary);
-            color: white;
-            border-color: var(--primary);
-            box-shadow: 0 4px 12px var(--accent-glow);
-        }
-
-        .section-title {
-            font-size: 20px;
-            font-weight: 800;
-            margin: 35px 0 18px 0;
-            color: var(--text-main);
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .section-title::before {
-            content: '';
-            width: 8px;
-            height: 24px;
-            background: var(--primary);
-            border-radius: 6px;
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-            gap: 18px;
+            padding-bottom: 15px;
             margin-bottom: 25px;
         }
 
-        .card {
-            background: #ffffff;
-            border: 2px solid var(--border-color);
-            border-radius: 18px;
-            padding: 20px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            font-weight: 700;
-            font-size: 16px;
-            color: var(--text-main);
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02);
-            position: relative;
+        .title-area h1 {
+            font-size: 1.8rem;
+            color: #334155;
+            margin: 0;
+            font-weight: 900;
         }
 
-        .card:hover {
-            border-color: var(--primary);
-            background: linear-gradient(135deg, #ffffff 0%, #e0e7ff 100%);
-            color: var(--primary);
-            transform: translateY(-5px);
-            box-shadow: 0 12px 25px -5px var(--accent-glow);
-        }
-
-        .hidden {
-            display: none !important;
-        }
-
-        .form-group {
-            margin-bottom: 22px;
-        }
-
-        label {
-            font-weight: 700;
-            display: block;
-            margin-bottom: 8px;
-            color: var(--text-main);
-            font-size: 15px;
-        }
-
-        input[type="text"], input[type="number"] {
-            width: 100%;
-            padding: 15px;
-            border: 2px solid #cbd5e1;
-            border-radius: 12px;
-            box-sizing: border-box;
-            font-size: 16px;
-            background: #f8fafc;
-            transition: all 0.3s;
-        }
-
-        input:focus {
-            border-color: var(--primary);
-            background: #fff;
-            box-shadow: 0 0 0 4px var(--accent-glow);
-            outline: none;
-        }
-
-        button.action-btn {
-            width: 100%;
-            padding: 15px;
-            background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
+        .lang-btn {
+            background: #4f46e5;
             color: white;
             border: none;
+            padding: 10px 18px;
             border-radius: 12px;
-            font-weight: 800;
             cursor: pointer;
-            font-size: 17px;
-            transition: all 0.3s;
-            box-shadow: 0 4px 15px var(--accent-glow);
+            font-weight: bold;
+            font-family: 'Tajawal', sans-serif;
+            transition: 0.3s;
+        }
+        .lang-btn:hover { background: #3730a3; }
+
+        .custom-ai-banner {
+            background: linear-gradient(135deg, #8b5cf6, #d946ef);
+            color: white;
+            padding: 20px;
+            border-radius: 18px;
+            text-align: center;
+            margin-bottom: 25px;
+            cursor: pointer;
+            box-shadow: 0 10px 20px rgba(217, 70, 239, 0.3);
+            transition: transform 0.2s;
+        }
+        .custom-ai-banner:hover { transform: scale(1.02); }
+        .custom-ai-banner h2 { margin: 0 0 5px 0; font-size: 1.4rem; }
+
+        .section-title {
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #1e293b;
+            margin-top: 20px;
+            margin-bottom: 15px;
+            border-right: 4px solid var(--primary);
+            padding-right: 10px;
+        }
+        body[dir="ltr"] .section-title {
+            border-right: none;
+            border-left: 4px solid var(--primary);
+            padding-right: 0;
+            padding-left: 10px;
         }
 
-        button.action-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 8px 25px var(--accent-glow);
-        }
-
-        .back-btn {
-            background: linear-gradient(135deg, #64748b 0%, #475569 100%) !important;
-            box-shadow: 0 4px 15px rgba(100, 116, 139, 0.3) !important;
-            margin-top: 15px;
-        }
-
-        #loadingOverlay {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(15, 23, 42, 0.85);
-            backdrop-filter: blur(8px);
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            z-index: 1000;
-            border-radius: 28px;
-            display: none;
-        }
-
-        .spinner {
-            width: 60px;
-            height: 60px;
-            border: 6px solid rgba(255, 255, 255, 0.1);
-            border-top: 6px solid #6366f1;
-            border-radius: 50%;
-            animation: spin 0.9s cubic-bezier(0.68, -0.55, 0.265, 1.55) infinite;
+        .grid-buttons {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
             margin-bottom: 20px;
         }
 
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+        .btn-card {
+            background: #ffffff;
+            border: 2px solid #e2e8f0;
+            padding: 15px;
+            border-radius: 14px;
+            text-align: center;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+        }
+        .btn-card:hover {
+            border-color: var(--primary);
+            color: var(--primary);
+            transform: translateY(-2px);
         }
 
-        .loading-text {
-            font-weight: 800;
-            color: #ffffff;
-            font-size: 20px;
-            letter-spacing: 0.5px;
+        .hidden { display: none !important; }
+
+        .input-group {
+            margin-bottom: 15px;
         }
+        .input-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+        }
+        .input-group input[type="text"], .input-group input[type="file"] {
+            width: 100%;
+            padding: 14px;
+            border: 2px solid #cbd5e1;
+            border-radius: 12px;
+            font-family: inherit;
+            box-sizing: border-box;
+            font-size: 1rem;
+        }
+
+        .action-btn {
+            width: 100%;
+            background: var(--primary);
+            color: white;
+            padding: 16px;
+            border: none;
+            border-radius: 14px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            cursor: pointer;
+            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.4);
+        }
+        .action-btn:hover { background: var(--primary-hover); }
 
         .result-box {
-            margin-top: 35px;
-            padding: 30px;
-            background: #ffffff;
-            border-radius: 20px;
-            border: 4px solid var(--accent-red);
-            box-shadow: 0 15px 35px rgba(244, 63, 94, 0.2);
-            display: none;
-            position: relative;
+            margin-top: 25px;
+            padding: 20px;
+            background: #f8fafc;
+            border-radius: 16px;
+            border: 2px solid #e2e8f0;
         }
-
-        .ai-section {
-            margin-top: 40px;
-            border-top: 2px dashed #cbd5e1;
-            padding-top: 35px;
+        .answer-highlight {
+            color: #dc2626;
+            font-weight: bold;
+            background: #fee2e2;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .page-preview {
+            width: 100%;
+            border-radius: 12px;
+            border: 2px solid #cbd5e1;
+            margin-top: 15px;
         }
     </style>
 </head>
 <body>
+
 <div class="container">
-    <div id="loadingOverlay">
-        <div class="spinner"></div>
-        <div class="loading-text" id="loadingMessage">جاري التحليل الذكي...</div>
+    <div class="header">
+        <div class="title-area">
+            <h1 id="app-title">🎓 المنصة التعليمية الذكية للمناهج</h1>
+        </div>
+        <button class="lang-btn" onclick="toggleLanguage()" id="lang-toggle-btn">English / عربي</button>
     </div>
 
-    <div class="header-flex">
-        <h2 id="mainHeading">🎓 منصة المنهج الذكي التعليمية</h2>
-        <button class="lang-btn" onclick="toggleLanguage()">English / عربي</button>
-    </div>
-    
-    <!-- الخطوة 1: اختيار الصف -->
-    <div id="stepGrade">
-        <div class="section-title">المرحلة الابتدائية:</div>
-        <div class="grid">
-            <div class="card" onclick="selectGrade('أولى ابتدائي')">🎒 أولى ابتدائي</div>
-            <div class="card" onclick="selectGrade('ثاني ابتدائي')">🎒 ثاني ابتدائي</div>
-            <div class="card" onclick="selectGrade('ثالث ابتدائي')">🎒 ثالث ابتدائي</div>
-            <div class="card" onclick="selectGrade('رابع ابتدائي')">🎒 رابع ابتدائي</div>
-            <div class="card" onclick="selectGrade('خامس ابتدائي')">🎒 خامس ابتدائي</div>
-            <div class="card" onclick="selectGrade('سادس ابتدائي')">🎒 سادس ابتدائي</div>
-        </div>
-
-        <div class="section-title">المرحلة المتوسطة:</div>
-        <div class="grid">
-            <div class="card" onclick="selectGrade('أولى متوسط')">📚 أولى متوسط</div>
-            <div class="card" onclick="selectGrade('ثاني متوسط')">📚 ثاني متوسط</div>
-            <div class="card" onclick="selectGrade('ثالث متوسط')">📚 ثالث متوسط</div>
-        </div>
-
-        <div class="section-title">المرحلة الثانوية:</div>
-        <div class="grid">
-            <div class="card" onclick="selectGrade('أولى ثانوي')">🎓 أولى ثانوي</div>
-            <div class="card" onclick="selectGrade('ثاني ثانوي (مسارات)')">🎓 ثاني ثانوي (مسارات)</div>
-            <div class="card" onclick="selectGrade('ثالث ثانوي')">🎓 ثالث ثانوي</div>
-        </div>
+    <!-- زر الذكاء الاصطناعي لكتابك الخاص -->
+    <div class="custom-ai-banner" onclick="showCustomPDFScreen()">
+        <h2 id="custom-pdf-title">🤖 الذكاء الاصطناعي لكتابك الخاص</h2>
+        <span id="custom-pdf-desc">اضغط هنا لرفع أي كتاب PDF واسأل الذكاء الاصطناعي عنه مباشرة!</span>
     </div>
 
-    <!-- الخطوة 2: اختيار الفصل -->
-    <div id="stepSemester" class="hidden">
-        <div class="section-title" id="semesterTitle">اختر الفصل الدراسي:</div>
-        <div class="grid">
-            <div class="card" onclick="selectSemester('الفصل الدراسي الأول')">📅 الفصل الدراسي الأول</div>
-            <div class="card" onclick="selectSemester('الفصل الدراسي الثاني')">📅 الفصل الدراسي الثاني</div>
-        </div>
-        <button class="action-btn back-btn" onclick="goBackToGrade()">⬅ رجوع لاختيار الصف</button>
-    </div>
-
-    <!-- الخطوة 3: اختيار المادة -->
-    <div id="stepSubject" class="hidden">
-        <div class="section-title" id="selectedGradeTitle">مواد الفصل الدراسي:</div>
-        <div class="grid" id="subjectsGrid"></div>
-        <button class="action-btn back-btn" onclick="goBackToSemester()">⬅ رجوع لاختيار الفصل</button>
-    </div>
-
-    <!-- الخطوة 4: الخيارات الأربعة -->
-    <div id="stepOptions" class="hidden">
-        <div class="section-title" id="selectedTitle">خيارات الكتاب:</div>
-        <div class="grid">
-            <div class="card" onclick="openBook('clean')">📖 الكتاب بدون حل (النظيف)</div>
-            <div class="card" onclick="openBook('solved')" style="background: #ecfdf5; border-color: #10b981; color: #047857;">📝 الكتاب محلول (كاملاً)</div>
-            <div class="card" onclick="openAinLessons()" style="background: #eff6ff; border-color: #3b82f6; color: #1d4ed8;">👨‍🏫 شرح الدروس (قنوات عين)</div>
-            <div class="card" onclick="showAiSearch()" style="background: #e0f2fe; border-color: #38bdf8; color: #0369a1;">🤖 المساعد الذكي للبحث الفوري</div>
-        </div>
-        <button class="action-btn back-btn" onclick="goBackToSubject()">⬅ رجوع لاختيار المادة</button>
-    </div>
-
-    <!-- الخطوة 5: البحث الذكي الفائق -->
-    <div id="aiSection" class="hidden ai-section">
-        <h3 style="color: var(--primary); margin-top: 0;" id="aiSearchTitle">🤖 البحث الذكي الفائق في الكتاب</h3>
-        
-        <div class="form-group">
-            <label style="color: #10b981; font-weight: bold;">✔ نظام الذكاء الاصطناعي متصل وجاهز للتحليل الدقيق</label>
-        </div>
-
-        <div class="form-group">
-            <label>رقم صفحة الكتاب الفعلية (فارق الأصفست عن ملف PDF، وإلا اتركه 0):</label>
-            <input type="number" id="pageOffset" value="0" placeholder="مثال: 0 أو 2">
-        </div>
-
-        <div class="form-group">
-            <label>اكتب سؤالك بوضوح تام:</label>
-            <input type="text" id="query" placeholder="مثال: ما هو قانون الجذب الكوني؟">
-        </div>
-
-        <button class="action-btn" onclick="searchBook()">بحث ذكي وتحليل دقيق 🔍</button>
-
-        <div id="resultBox" class="result-box">
-            <p id="answerText" style="font-size: 17px; font-weight: 600; line-height: 1.9; color: #1e293b; background: #f8fafc; padding: 18px; border-radius: 12px; border-right: 5px solid var(--accent-red);"></p>
-            <div style="margin-top: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
-                <span id="pageText" style="font-weight: bold; color: #dc2626; font-size: 15px;"></span>
-                <a id="viewFullPageBtn" href="#" target="_blank" style="background: var(--primary); color: white; padding: 10px 18px; border-radius: 10px; text-decoration: none; font-weight: bold; font-size: 14px; display: none; box-shadow: 0 4px 12px var(--accent-glow);">📄 فتح الصفحة كاملة في الكتاب</a>
+    <!-- شاشة الرفع الخاص -->
+    <div id="custom-pdf-screen" class="hidden">
+        <button class="btn-card" style="margin-bottom: 15px;" onclick="goBackToHome()" id="back-home-btn">← العودة للمراحل الدراسية</button>
+        <h3 id="custom-upload-heading">ارفق كتابك الخاص (PDF) ووجّه سؤالك:</h3>
+        <form id="custom-pdf-form" onsubmit="handleCustomPDFSubmit(event)">
+            <div class="input-group">
+                <label id="label-choose-file">اختر ملف الـ PDF:</label>
+                <input type="file" id="custom-file-input" accept="application/pdf" required>
             </div>
+            <div class="input-group">
+                <label id="label-custom-query">اكتب سؤالك بوضوح تام:</label>
+                <input type="text" id="custom-query-input" placeholder="مثال: ما هو تعريف الحركة الموجية؟" required>
+            </div>
+            <button type="submit" class="action-btn" id="custom-submit-btn">تحليل المستند واستخراج الإجابة 🔍</button>
+        </form>
+    </div>
+
+    <!-- الشاشة الرئيسية للمراحل -->
+    <div id="main-curriculum-screen">
+        <div class="section-title" id="stages-heading">اختر المرحلة الدراسية:</div>
+        <div class="grid-buttons">
+            <div class="btn-card" onclick="selectStage('primary')" id="btn-primary">🎒 المرحلة الابتدائية</div>
+            <div class="btn-card" onclick="selectStage('intermediate')" id="btn-intermediate">📚 المرحلة المتوسطة</div>
+            <div class="btn-card" onclick="selectStage('secondary')" id="btn-secondary">🎓 المرحلة الثانوية (مسارات)</div>
+        </div>
+
+        <div id="years-section" class="hidden">
+            <div class="section-title" id="years-heading">اختر السنة الدراسية:</div>
+            <div class="grid-buttons" id="years-grid"></div>
+        </div>
+
+        <div id="terms-section" class="hidden">
+            <div class="section-title" id="terms-heading">اختر الفصل الدراسي:</div>
+            <div class="grid-buttons" id="terms-grid"></div>
+        </div>
+
+        <div id="subjects-section" class="hidden">
+            <div class="section-title" id="subjects-heading">المواد الدراسية المتاحة:</div>
+            <div class="grid-buttons" id="subjects-grid"></div>
+        </div>
+
+        <!-- واجهة البحث داخل كتاب المنهج -->
+        <div id="search-section" class="hidden">
+            <button class="btn-card" style="margin-bottom: 15px;" onclick="resetSelection()" id="back-select-btn">← رجوع لاختيار المادة</button>
+            <div class="section-title" id="search-heading">🤖 البحث الذكي الفائق في كتاب: <span id="selected-book-name" style="color: var(--primary);"></span></div>
+            
+            <div class="input-group">
+                <label id="label-query">اكتب سؤالك بوضوح تام:</label>
+                <input type="text" id="search-query" placeholder="مثال: ما هو قانون الجذب الكوني؟" required>
+            </div>
+            <button class="action-btn" onclick="executeSearch()" id="search-btn">بحث ذكي وتحليل دقيق 🔍</button>
+        </div>
+    </div>
+
+    <!-- عرض النتائج -->
+    <div id="result-container" class="result-box hidden">
+        <h3 id="result-heading" style="color: var(--primary); margin-top:0;">🎯 النتيجة والتحليل الذكي:</h3>
+        <p><strong>رقم الصفحة:</strong> <span id="result-page"></span></p>
+        <p><strong>الإجابة:</strong> <span id="result-answer"></span></p>
+        <div id="image-container">
+            <h4>الصفحة المحددة من الكتاب:</h4>
+            <img id="result-image" class="page-preview" src="" alt="صفحة الكتاب">
         </div>
     </div>
 </div>
 
 <script>
-let currentGrade = "";
-let currentSemester = "";
-let currentSubject = "";
-let currentCleanFile = "";
-let currentSolvedFile = "";
-let currentAinLink = "";
+    let currentLang = 'ar';
+    let currentStage = '';
+    let currentYear = '';
+    let currentTerm = '';
+    let selectedBookCode = '';
 
-const curriculumData = {
-    "ثاني ثانوي (مسارات)": {
-        "الفصل الدراسي الأول": [
-            { name: "الرياضيات 3", clean: "math3_t1.pdf", solved: "math3_t1_solved.pdf", ain: "https://ien.edu.sa/" },
-            { name: "الفيزياء 2", clean: "physics2_t1.pdf", solved: "physics2_t1_solved.pdf", ain: "https://ien.edu.sa/" },
-            { name: "الكيمياء 2", clean: "chemistry2_t1.pdf", solved: "chemistry2_t1_solved.pdf", ain: "https://ien.edu.sa/" },
-            { name: "الأحياء 2", clean: "biology2_t1.pdf", solved: "biology2_t1_solved.pdf", ain: "https://ien.edu.sa/" }
-        ],
-        "الفصل الدراسي الثاني": [
-            { name: "الرياضيات 4", clean: "math4_t2.pdf", solved: "math4_t2_solved.pdf", ain: "https://ien.edu.sa/" },
-            { name: "الفيزياء 3", clean: "physics3_t2.pdf", solved: "physics3_t2_solved.pdf", ain: "https://ien.edu.sa/" }
-        ]
-    },
-    "ثالث ثانوي": {
-        "الفصل الدراسي الأول": [
-            { name: "الرياضيات 5", clean: "math5_t1.pdf", solved: "math5_t1_solved.pdf", ain: "https://ien.edu.sa/" },
-            { name: "الفيزياء 4", clean: "physics4_t1.pdf", solved: "physics4_t1_solved.pdf", ain: "https://ien.edu.sa/" }
-        ],
-        "الفصل الدراسي الثاني": [
-            { name: "الرياضيات 6", clean: "math6_t2.pdf", solved: "math6_t2_solved.pdf", ain: "https://ien.edu.sa/" },
-            { name: "الفيزياء 5", clean: "physics5_t2.pdf", solved: "physics5_t2_solved.pdf", ain: "https://ien.edu.sa/" }
-        ]
-    }
-};
-
-function showLoading(message) {
-    document.getElementById('loadingMessage').innerText = message;
-    document.getElementById('loadingOverlay').style.display = 'flex';
-}
-
-function hideLoading() {
-    document.getElementById('loadingOverlay').style.display = 'none';
-}
-
-function selectGrade(grade) {
-    currentGrade = grade;
-    document.getElementById('semesterTitle').innerText = `اختر الفصل الدراسي لـ (${grade}):`;
-    document.getElementById('stepGrade').classList.add('hidden');
-    document.getElementById('stepSemester').classList.remove('hidden');
-}
-
-function selectSemester(semester) {
-    currentSemester = semester;
-    document.getElementById('selectedGradeTitle').innerText = `مقررات (${currentGrade} - ${semester}):`;
-    
-    const grid = document.getElementById('subjectsGrid');
-    grid.innerHTML = "";
-    
-    const subjects = curriculumData[currentGrade]?.[semester] || [
-        { name: "رياضيات عام", clean: "general_math.pdf", solved: "general_math_solved.pdf", ain: "https://ien.edu.sa/" }
-    ];
-    
-    subjects.forEach(sub => {
-        const card = document.createElement('div');
-        card.className = "card";
-        card.innerText = "📖 " + sub.name;
-        card.onclick = () => selectSubject(sub.name, sub.clean, sub.solved, sub.ain);
-        grid.appendChild(card);
-    });
-
-    document.getElementById('stepSemester').classList.add('hidden');
-    document.getElementById('stepSubject').classList.remove('hidden');
-}
-
-function selectSubject(subjectName, cleanFile, solvedFile, ainLink) {
-    currentSubject = subjectName;
-    currentCleanFile = cleanFile;
-    currentSolvedFile = solvedFile;
-    currentAinLink = ainLink;
-    document.getElementById('selectedTitle').innerText = `الصف: ${currentGrade} | ${currentSemester} | المادة: ${subjectName}`;
-    document.getElementById('stepSubject').classList.add('hidden');
-    document.getElementById('stepOptions').classList.remove('hidden');
-}
-
-function openBook(type) {
-    let fileName = (type === 'solved') ? currentSolvedFile : currentCleanFile;
-    showLoading(type === 'solved' ? 'جاري تجهيز الكتاب المحلول...' : 'جاري فتح الكتاب...');
-    setTimeout(() => {
-        hideLoading();
-        window.open(`/view-book/${fileName}`, '_blank');
-    }, 600);
-}
-
-function openAinLessons() {
-    showLoading('جاري فتح شروحات قنوات عين...');
-    setTimeout(() => {
-        hideLoading();
-        window.open(currentAinLink, '_blank');
-    }, 500);
-}
-
-function goBackToGrade() {
-    document.getElementById('stepSemester').classList.add('hidden');
-    document.getElementById('stepGrade').classList.remove('hidden');
-}
-
-function goBackToSemester() {
-    document.getElementById('stepSubject').classList.add('hidden');
-    document.getElementById('stepSemester').classList.remove('hidden');
-}
-
-function goBackToSubject() {
-    document.getElementById('stepOptions').classList.add('hidden');
-    document.getElementById('stepSubject').classList.remove('hidden');
-    document.getElementById('aiSection').classList.add('hidden');
-}
-
-function showAiSearch() {
-    document.getElementById('aiSection').classList.remove('hidden');
-    document.getElementById('aiSearchTitle').innerText = `🤖 البحث الذكي الفائق في كتاب: ${currentSubject}`;
-    window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
-}
-
-async function searchBook() {
-    const query = document.getElementById('query').value;
-    const offset = parseInt(document.getElementById('pageOffset').value) || 0;
-    
-    if (!query) { alert('الرجاء إدخال سؤالك بدقة'); return; }
-
-    showLoading('جاري تحليل محتوى الكتاب واستخراج الإجابة الدقيقة...');
-
-    try {
-        const res = await fetch(`/search-book/?book_name=${encodeURIComponent(currentCleanFile)}&query=${encodeURIComponent(query)}&offset=${offset}`, { method: 'POST' });
-        const data = await res.json();
-        
-        hideLoading();
-        const resultBox = document.getElementById('resultBox');
-        resultBox.style.display = 'block';
-        
-        if(data.error) {
-            document.getElementById('answerText').innerText = data.error;
-            document.getElementById('pageText').innerText = "";
-            document.getElementById('viewFullPageBtn').style.display = 'none';
-        } else {
-            document.getElementById('answerText').innerText = "📌 " + data.extracted_text;
-            document.getElementById('pageText').innerText = `📄 رقم الصفحة الفعلية في الكتاب: ${data.page_number}`;
-            const fullPageBtn = document.getElementById('viewFullPageBtn');
-            fullPageBtn.style.display = 'inline-block';
-            fullPageBtn.href = `/view-book/${currentCleanFile}#page=${data.page_number}`;
+    const translations = {
+        ar: {
+            appTitle: "🎓 المنصة التعليمية الذكية للمناهج",
+            customPdfTitle: "🤖 الذكاء الاصطناعي لكتابك الخاص",
+            customPdfDesc: "اضغط هنا لرفع أي كتاب PDF واسأل الذكاء الاصطناعي عنه مباشرة!",
+            stagesHeading: "اختر المرحلة الدراسية:",
+            btnPrimary: "🎒 المرحلة الابتدائية",
+            btnIntermediate: "📚 المرحلة المتوسطة",
+            btnSecondary: "🎓 المرحلة الثانوية (مسارات)",
+            yearsHeading: "اختر السنة الدراسية:",
+            termsHeading: "اختر الفصل الدراسي:",
+            subjectsHeading: "المواد الدراسية المتاحة:",
+            searchHeading: "🤖 البحث الذكي الفائق في كتاب: ",
+            labelQuery: "اكتب سؤالك بوضوح تام:",
+            searchBtn: "بحث ذكي وتحليل دقيق 🔍",
+            backSelectBtn: "← رجوع لاختيار المادة",
+            backHomeBtn: "← العودة للمراحل الدراسية",
+            customUploadHeading: "ارفق كتابك الخاص (PDF) ووجّه سؤالك:",
+            labelChooseFile: "اختر ملف الـ PDF:",
+            labelCustomQuery: "اكتب سؤالك بوضوح تام:",
+            customSubmitBtn: "تحليل المستند واستخراج الإجابة 🔍",
+            term1: "الفصل الدراسي الأول",
+            term2: "الفصل الدراسي الثاني",
+            term3: "الفصل الدراسي الثالث",
+            year1: "الصف الأول", year2: "الصف الثاني", year3: "الصف الثالث",
+            year4: "الصف الرابع", year5: "الصف الخامس", year6: "الصف السادس",
+            yearSec1: "السنة الأولى المشتركة", yearSec2: "السنة الثانية", yearSec3: "السنة الثالثة"
+        },
+        en: {
+            appTitle: "🎓 Smart Curriculum Educational Platform",
+            customPdfTitle: "🤖 AI for Your Custom PDF Book",
+            customPdfDesc: "Click here to upload any PDF book and ask AI questions directly!",
+            stagesHeading: "Select Educational Stage:",
+            btnPrimary: "🎒 Primary School",
+            btnIntermediate: "📚 Middle School",
+            btnSecondary: "🎓 High School (Tracks)",
+            yearsHeading: "Select Academic Year:",
+            termsHeading: "Select Term:",
+            subjectsHeading: "Available Subjects:",
+            searchHeading: "🤖 AI Search in Book: ",
+            labelQuery: "Write your question clearly:",
+            searchBtn: "Smart Search & Analyze 🔍",
+            backSelectBtn: "← Back to Subject Selection",
+            backHomeBtn: "← Back to Educational Stages",
+            customUploadHeading: "Upload your custom PDF book & ask a question:",
+            labelChooseFile: "Select PDF File:",
+            labelCustomQuery: "Write your question clearly:",
+            customSubmitBtn: "Analyze Document & Extract Answer 🔍",
+            term1: "First Term",
+            term2: "Second Term",
+            term3: "Third Term",
+            year1: "Grade 1", year2: "Grade 2", year3: "Grade 3",
+            year4: "Grade 4", year5: "Grade 5", year6: "Grade 6",
+            yearSec1: "First Common Year", yearSec2: "Second Year", yearSec3: "Third Year"
         }
-    } catch (err) {
-        hideLoading();
-        alert('حدث خطأ أثناء الاتصال بالخادم.');
-    }
-}
+    };
 
-function toggleLanguage() {
-    const html = document.documentElement;
-    if (html.getAttribute('dir') === 'rtl') {
-        html.setAttribute('dir', 'ltr');
-        html.setAttribute('lang', 'en');
-        document.getElementById('mainHeading').innerText = "🎓 Smart Curriculum Educational Platform";
-    } else {
-        html.setAttribute('dir', 'rtl');
-        html.setAttribute('lang', 'ar');
-        document.getElementById('mainHeading').innerText = "🎓 منصة المنهج الذكي التعليمية";
+    const subjectsData = {
+        primary: {
+            years: [1, 2, 3, 4, 5, 6],
+            subjects: {
+                ar: ["القرآن الكريم", "التربية الإسلامية", "لغتي", "الرياضيات", "العلوم", "الدراسات الاجتماعية", "المهارات الرقمية", "التربية الفنية", "التربية البدنية"],
+                en: ["Holy Quran", "Islamic Studies", "My Language (Arabic)", "Mathematics", "Science", "Social Studies", "Digital Skills", "Art Education", "Physical Education"]
+            }
+        },
+        intermediate: {
+            years: [1, 2, 3],
+            subjects: {
+                ar: ["القرآن والتفسير", "الحديث والسيرة", "التوحيد والفقه", "لغتي الخالدة", "اللغة الإنجليزية", "الرياضيات", "العلوم", "الدراسات الاجتماعية", "المهارات الرقمية", "التربية الفنية"],
+                en: ["Quran & Tafseer", "Hadith & Seerah", "Islamic Faith & Fiqh", "Arabic Language", "English Language", "Mathematics", "Science", "Social Studies", "Digital Skills", "Art Education"]
+            }
+        },
+        secondary: {
+            years: [1, 2, 3],
+            subjects: {
+                ar: ["الفيزياء 2", "الكيمياء", "الأحياء", "الرياضيات 2", "التقنية الرقمية", "الدراسات الاجتماعية", "اللغة الإنجليزية", "التفكير النقدي", "اللياقة والثقافة الصحية"],
+                en: ["Physics 2", "Chemistry", "Biology", "Mathematics 2", "Digital Technology", "Social Studies", "English Language", "Critical Thinking", "Fitness & Health Culture"]
+            }
+        }
+    };
+
+    function toggleLanguage() {
+        currentLang = currentLang === 'ar' ? 'en' : 'ar';
+        document.documentElement.dir = currentLang === 'ar' ? 'rtl' : 'ltr';
+        document.documentElement.lang = currentLang;
+
+        const t = translations[currentLang];
+        document.getElementById('app-title').innerText = t.appTitle;
+        document.getElementById('custom-pdf-title').innerText = t.customPdfTitle;
+        document.getElementById('custom-pdf-desc').innerText = t.customPdfDesc;
+        document.getElementById('stages-heading').innerText = t.stagesHeading;
+        document.getElementById('btn-primary').innerText = t.btnPrimary;
+        document.getElementById('btn-intermediate').innerText = t.btnIntermediate;
+        document.getElementById('btn-secondary').innerText = t.btnSecondary;
+        document.getElementById('years-heading').innerText = t.yearsHeading;
+        document.getElementById('terms-heading').innerText = t.termsHeading;
+        document.getElementById('subjects-heading').innerText = t.subjectsHeading;
+        document.getElementById('label-query').innerText = t.labelQuery;
+        document.getElementById('search-btn').innerText = t.searchBtn;
+        document.getElementById('back-select-btn').innerText = t.backSelectBtn;
+        document.getElementById('back-home-btn').innerText = t.backHomeBtn;
+        document.getElementById('custom-upload-heading').innerText = t.customUploadHeading;
+        document.getElementById('label-choose-file').innerText = t.labelChooseFile;
+        document.getElementById('label-custom-query').innerText = t.labelCustomQuery;
+        document.getElementById('custom-submit-btn').innerText = t.customSubmitBtn;
+
+        if (currentStage) selectStage(currentStage);
     }
-}
+
+    function selectStage(stage) {
+        currentStage = stage;
+        document.getElementById('years-section').classList.remove('hidden');
+        document.getElementById('terms-section').classList.add('hidden');
+        document.getElementById('subjects-section').classList.add('hidden');
+        document.getElementById('search-section').classList.add('hidden');
+
+        const yearsGrid = document.getElementById('years-grid');
+        yearsGrid.innerHTML = '';
+        
+        const yearsList = subjectsData[stage].years;
+        yearsList.forEach(yr => {
+            let label = "";
+            if (stage === 'secondary') {
+                label = translations[currentLang][`yearSec${yr}`];
+            } else {
+                label = translations[currentLang][`year${yr}`];
+            }
+            const btn = document.createElement('div');
+            btn.className = 'btn-card';
+            btn.innerText = label;
+            btn.onclick = () => selectYear(yr);
+            yearsGrid.appendChild(btn);
+        });
+    }
+
+    function selectYear(yr) {
+        currentYear = yr;
+        document.getElementById('terms-section').classList.remove('hidden');
+        document.getElementById('subjects-section').classList.add('hidden');
+        
+        const termsGrid = document.getElementById('terms-grid');
+        termsGrid.innerHTML = '';
+        [1, 2, 3].forEach(term => {
+            const btn = document.createElement('div');
+            btn.className = 'btn-card';
+            btn.innerText = translations[currentLang][`term${term}`];
+            btn.onclick = () => selectTerm(term);
+            termsGrid.appendChild(btn);
+        });
+    }
+
+    function selectTerm(term) {
+        currentTerm = term;
+        document.getElementById('subjects-section').classList.remove('hidden');
+        
+        const subjectsGrid = document.getElementById('subjects-grid');
+        subjectsGrid.innerHTML = '';
+        const list = subjectsData[currentStage].subjects[currentLang];
+
+        list.forEach((sub, idx) => {
+            const btn = document.createElement('div');
+            btn.className = 'btn-card';
+            btn.innerText = sub;
+            btn.onclick = () => selectBook(sub, `physics2_t1`);
+            subjectsGrid.appendChild(btn);
+        });
+    }
+
+    function selectBook(bookName, code) {
+        selectedBookCode = code;
+        document.getElementById('selected-book-name').innerText = bookName;
+        document.getElementById('search-section').classList.remove('hidden');
+    }
+
+    function resetSelection() {
+        document.getElementById('search-section').classList.add('hidden');
+        document.getElementById('result-container').classList.add('hidden');
+    }
+
+    function showCustomPDFScreen() {
+        document.getElementById('main-curriculum-screen').classList.add('hidden');
+        document.getElementById('custom-pdf-screen').classList.remove('hidden');
+        document.getElementById('result-container').classList.add('hidden');
+    }
+
+    function goBackToHome() {
+        document.getElementById('custom-pdf-screen').classList.add('hidden');
+        document.getElementById('main-curriculum-screen').classList.remove('hidden');
+        document.getElementById('result-container').classList.add('hidden');
+    }
+
+    async function executeSearch() {
+        const q = document.getElementById('search-query').value;
+        if (!q) return alert(currentLang === 'ar' ? "يرجى كتابة السؤال أولاً" : "Please enter a question");
+
+        const resBox = document.getElementById('result-container');
+        resBox.classList.remove('hidden');
+        document.getElementById('result-answer').innerText = currentLang === 'ar' ? "جاري البحث والتحليل الذكي..." : "Analyzing...";
+
+        try {
+            const resp = await fetch(`/api/search?book_code=${selectedBookCode}&query=${encodeURIComponent(q)}`);
+            const data = await resp.json();
+            if (resp.ok) {
+                document.getElementById('result-page').innerText = data.page_number;
+                document.getElementById('result-answer').innerHTML = data.answer.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
+                document.getElementById('result-image').src = data.page_image;
+            } else {
+                document.getElementById('result-answer').innerText = data.error_ar || data.error;
+            }
+        } catch(e) {
+            document.getElementById('result-answer').innerText = "حدث خطأ أثناء الاتصال بالسيرفر.";
+        }
+    }
+
+    async function handleCustomPDFSubmit(e) {
+        e.preventDefault();
+        const fileInput = document.getElementById('custom-file-input');
+        const queryInput = document.getElementById('custom-query-input');
+
+        if (!fileInput.files[0]) return;
+
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        formData.append('query', queryInput.value);
+
+        const resBox = document.getElementById('result-container');
+        resBox.classList.remove('hidden');
+        document.getElementById('result-answer').innerText = currentLang === 'ar' ? "جاري رفع وقراءة ملف الـ PDF الخاص بك بالذكاء الاصطناعي..." : "Processing custom PDF...";
+
+        try {
+            const resp = await fetch('/api/custom-pdf-search', {
+                method: 'POST',
+                body: formData
+            });
+            const data = await resp.json();
+            if (resp.ok) {
+                document.getElementById('result-page').innerText = data.page_number;
+                document.getElementById('result-answer').innerText = data.answer;
+                document.getElementById('result-image').src = data.page_image;
+            } else {
+                document.getElementById('result-answer').innerText = data.error || "تعذر تحليل الملف.";
+            }
+        } catch(e) {
+            document.getElementById('result-answer').innerText = "حدث خطأ في عملية رفع أو تحليل الملف.";
+        }
+    }
 </script>
 </body>
 </html>
-"""
-
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTML_CONTENT
-
-@app.get("/view-book/{book_name}")
-async def view_book(book_name: str):
-    file_path = f"books/{book_name}"
-    if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="application/pdf", filename=book_name)
-    return HTMLResponse("<h3>عذراً، ملف الكتاب غير متوفر في السيرفر حالياً.</h3>", status_code=404)
-
-@app.post("/search-book/")
-async def search_book(book_name: str, query: str, offset: int = 0):
-    pdf_path = f"books/{book_name}"
-    if not os.path.exists(pdf_path):
-        return {"error": f"عذراً، كتاب ({book_name}) غير مرفوع حالياً في السيرفر."}
-    
-    reader = PdfReader(pdf_path)
-    matched_text = ""
-    found_page = 1
-    
-    keywords = [kw.strip() for kw in query.split() if len(kw.strip()) > 2]
-    if not keywords:
-        keywords = query.split()
-
-    best_match_score = 0
-    
-    for page_num, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        score = sum(1 for kw in keywords if kw in text)
-        if score > best_match_score:
-            best_match_score = score
-            found_page = (page_num + 1) + offset
-            lines = text.split('\n')
-            relevant_lines = [line for line in lines if any(kw in line for kw in keywords)]
-            if relevant_lines:
-                matched_text = " ".join(relevant_lines[:5])
-            else:
-                matched_text = text[:500].replace("\n", " ")
-            
-    if best_match_score == 0 or not matched_text:
-        return {"error": "لم يتم العثور على مطابقة دقيقة لهذا السؤال داخل صفحات الكتاب."}
-
-    return {
-        "page_number": found_page,
-        "extracted_text": matched_text
-    }
+    """
+    return HTMLResponse(content=html_content)

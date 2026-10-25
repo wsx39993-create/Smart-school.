@@ -8,7 +8,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 
-# إعداد مفتاح API الخاص بـ Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -36,10 +35,7 @@ def search_pdf_text(pdf_path: str, query: str):
     for page_idx in range(len(doc)):
         page = doc[page_idx]
         text = page.get_text("text")
-        score = 0
-        for kw in keywords:
-            if kw.lower() in text.lower():
-                score += 1
+        score = sum(1 for kw in keywords if kw.lower() in text.lower())
         if score > 0:
             matched_pages.append((page_idx, score))
 
@@ -53,7 +49,7 @@ def render_page_with_highlight(doc: fitz.Document, page_num: int, highlight_text
         for inst in text_instances:
             page.draw_rect(inst, color=(1, 0, 0), fill=(1, 0.8, 0.8), overlay=True)
 
-    pix = page.get_pixmap(dpi=150)
+    pix = page.get_pixmap(dpi=120)
     img_bytes = pix.tobytes("png")
     encoded = base64.b64encode(img_bytes).decode('utf-8')
     return f"data:image/png;base64,{encoded}"
@@ -67,7 +63,7 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
         return JSONResponse(
             status_code=404,
             content={"error_ar": "عذراً، الكتاب غير متوفر حالياً في المكتبة الرقمية.",
-                      "error_en": "Sorry, this book is currently not available in the library."}
+                      "error_en": "Sorry, this book is currently not available in the digital library."}
         )
 
     try:
@@ -76,7 +72,7 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
         best_page_idx = top_pages[0]
         page = doc[best_page_idx]
 
-        pix = page.get_pixmap(dpi=150)
+        pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
         model = get_gemini_model()
@@ -121,7 +117,8 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
         best_page_idx = 0
         max_score = -1
 
-        for page_idx in range(len(doc)):
+        search_limit = min(len(doc), 60)
+        for page_idx in range(search_limit):
             text = doc[page_idx].get_text("text")
             score = sum(1 for kw in keywords if kw.lower() in text.lower())
             if score > max_score:
@@ -129,7 +126,7 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
                 best_page_idx = page_idx
 
         page = doc[best_page_idx]
-        pix = page.get_pixmap(dpi=150)
+        pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
         model = get_gemini_model()
@@ -155,6 +152,7 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
         return {
             "page_number": best_page_idx + 1,
             "answer": answer_text,
+            "highlight": highlight_str,
             "page_image": img_b64
         }
     except Exception as e:
@@ -173,12 +171,11 @@ def index():
     <style>
         :root {
             --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #311042 100%);
-            --card-bg: rgba(255, 255, 255, 0.92);
+            --card-bg: rgba(255, 255, 255, 0.95);
             --primary: #4f46e5;
             --primary-hover: #4338ca;
-            --secondary: #06b6d4;
-            --accent-red: #ef4444;
-            --text-dark: #1e293b;
+            --accent: #8b5cf6;
+            --text-dark: #0f172a;
         }
 
         body {
@@ -186,18 +183,18 @@ def index():
             background: var(--bg-gradient);
             min-height: 100vh;
             margin: 0;
-            padding: 20px 10px;
+            padding: 25px 12px;
             color: var(--text-dark);
         }
 
         .container {
-            max-width: 900px;
+            max-width: 850px;
             margin: 0 auto;
             background: var(--card-bg);
-            border-radius: 24px;
-            padding: 30px 20px;
+            border-radius: 28px;
+            padding: 30px;
             box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-            backdrop-filter: blur(10px);
+            backdrop-filter: blur(12px);
         }
 
         .header {
@@ -205,102 +202,127 @@ def index():
             justify-content: space-between;
             align-items: center;
             border-bottom: 2px solid #e2e8f0;
-            padding-bottom: 15px;
+            padding-bottom: 18px;
             margin-bottom: 25px;
         }
 
         .title-area h1 {
             font-size: 1.8rem;
-            color: #334155;
+            color: var(--text-dark);
             margin: 0;
             font-weight: 900;
         }
 
         .lang-btn {
-            background: #4f46e5;
+            background: var(--primary);
             color: white;
             border: none;
-            padding: 10px 18px;
+            padding: 10px 20px;
             border-radius: 12px;
             cursor: pointer;
             font-weight: bold;
             font-family: 'Tajawal', sans-serif;
             transition: 0.3s;
+            box-shadow: 0 4px 12px rgba(79, 70, 229, 0.3);
         }
-        .lang-btn:hover { background: #3730a3; }
+        .lang-btn:hover { background: var(--primary-hover); }
 
         .custom-ai-banner {
             background: linear-gradient(135deg, #8b5cf6, #d946ef);
             color: white;
-            padding: 20px;
-            border-radius: 18px;
+            padding: 22px;
+            border-radius: 20px;
             text-align: center;
             margin-bottom: 25px;
             cursor: pointer;
-            box-shadow: 0 10px 20px rgba(217, 70, 239, 0.3);
-            transition: transform 0.2s;
+            box-shadow: 0 10px 25px rgba(217, 70, 239, 0.35);
+            transition: transform 0.2s, box-shadow 0.2s;
         }
-        .custom-ai-banner:hover { transform: scale(1.02); }
-        .custom-ai-banner h2 { margin: 0 0 5px 0; font-size: 1.4rem; }
+        .custom-ai-banner:hover { transform: translateY(-2px); box-shadow: 0 14px 30px rgba(217, 70, 239, 0.45); }
+        .custom-ai-banner h2 { margin: 0 0 6px 0; font-size: 1.5rem; }
 
         .section-title {
-            font-size: 1.3rem;
-            font-weight: 700;
-            color: #1e293b;
-            margin-top: 20px;
-            margin-bottom: 15px;
-            border-right: 4px solid var(--primary);
-            padding-right: 10px;
+            font-size: 1.4rem;
+            font-weight: 800;
+            color: var(--text-dark);
+            margin-bottom: 20px;
+            border-right: 5px solid var(--primary);
+            padding-right: 12px;
         }
         body[dir="ltr"] .section-title {
             border-right: none;
-            border-left: 4px solid var(--primary);
+            border-left: 5px solid var(--primary);
             padding-right: 0;
-            padding-left: 10px;
+            padding-left: 12px;
         }
 
         .grid-buttons {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-            gap: 12px;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
             margin-bottom: 20px;
         }
 
         .btn-card {
             background: #ffffff;
             border: 2px solid #e2e8f0;
-            padding: 15px;
-            border-radius: 14px;
+            padding: 18px;
+            border-radius: 16px;
             text-align: center;
             font-weight: bold;
+            font-size: 1.05rem;
             cursor: pointer;
-            transition: all 0.2s;
-            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+            transition: all 0.25s ease;
+            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.04);
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
         .btn-card:hover {
             border-color: var(--primary);
             color: var(--primary);
-            transform: translateY(-2px);
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px -5px rgba(79, 70, 229, 0.2);
         }
+
+        .back-btn {
+            background: #f1f5f9;
+            color: #475569;
+            border: 1px solid #cbd5e1;
+            padding: 10px 18px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-bottom: 20px;
+            display: inline-block;
+            transition: 0.2s;
+        }
+        .back-btn:hover { background: #e2e8f0; color: #1e293b; }
 
         .hidden { display: none !important; }
 
         .input-group {
-            margin-bottom: 15px;
+            margin-bottom: 18px;
         }
         .input-group label {
             display: block;
             margin-bottom: 8px;
             font-weight: bold;
+            font-size: 1.05rem;
         }
         .input-group input[type="text"], .input-group input[type="file"] {
             width: 100%;
-            padding: 14px;
+            padding: 15px;
             border: 2px solid #cbd5e1;
-            border-radius: 12px;
+            border-radius: 14px;
             font-family: inherit;
             box-sizing: border-box;
             font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+        .input-group input[type="text"]:focus {
+            outline: none;
+            border-color: var(--primary);
         }
 
         .action-btn {
@@ -313,15 +335,16 @@ def index():
             font-size: 1.1rem;
             font-weight: bold;
             cursor: pointer;
-            box-shadow: 0 10px 15px -3px rgba(79, 70, 229, 0.4);
+            box-shadow: 0 10px 20px -3px rgba(79, 70, 229, 0.4);
+            transition: 0.2s;
         }
         .action-btn:hover { background: var(--primary-hover); }
 
         .result-box {
             margin-top: 25px;
-            padding: 20px;
+            padding: 22px;
             background: #f8fafc;
-            border-radius: 16px;
+            border-radius: 20px;
             border: 2px solid #e2e8f0;
         }
         .answer-highlight {
@@ -333,27 +356,26 @@ def index():
         }
         .page-preview {
             width: 100%;
-            border-radius: 12px;
+            border-radius: 14px;
             border: 2px solid #cbd5e1;
             margin-top: 15px;
         }
 
-        /* تنسيق دائرة التحميل (Spinner) */
         .spinner-container {
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
-            padding: 20px;
+            padding: 25px 10px;
         }
         .spinner {
-            width: 45px;
-            height: 45px;
+            width: 50px;
+            height: 50px;
             border: 5px solid #e2e8f0;
             border-top: 5px solid var(--primary);
             border-radius: 50%;
             animation: spin 1s linear infinite;
-            margin-bottom: 12px;
+            margin-bottom: 15px;
         }
         @keyframes spin {
             0% { transform: rotate(0deg); }
@@ -371,15 +393,15 @@ def index():
         <button class="lang-btn" onclick="toggleLanguage()" id="lang-toggle-btn">English / عربي</button>
     </div>
 
-    <!-- زر الذكاء الاصطناعي لكتابك الخاص -->
-    <div class="custom-ai-banner" onclick="showCustomPDFScreen()">
+    <!-- بنر الذكاء الاصطناعي لكتابك الخاص -->
+    <div class="custom-ai-banner" onclick="navigateTo('custom-pdf-screen')" id="banner-area">
         <h2 id="custom-pdf-title">🤖 الذكاء الاصطناعي لكتابك الخاص</h2>
         <span id="custom-pdf-desc">اضغط هنا لرفع أي كتاب PDF واسأل الذكاء الاصطناعي عنه مباشرة!</span>
     </div>
 
     <!-- شاشة الرفع الخاص -->
     <div id="custom-pdf-screen" class="hidden">
-        <button class="btn-card" style="margin-bottom: 15px;" onclick="goBackToHome()" id="back-home-btn">← العودة للمراحل الدراسية</button>
+        <button class="back-btn" onclick="navigateTo('stages-screen')" id="back-stages-btn">← العودة للمراحل الدراسية</button>
         <h3 id="custom-upload-heading">ارفق كتابك الخاص (PDF) ووجّه سؤالك:</h3>
         <form id="custom-pdf-form" onsubmit="handleCustomPDFSubmit(event)">
             <div class="input-group">
@@ -394,50 +416,67 @@ def index():
         </form>
     </div>
 
-    <!-- الشاشة الرئيسية للمراحل -->
-    <div id="main-curriculum-screen">
+    <!-- 1. شاشة المراحل الدراسية -->
+    <div id="stages-screen">
         <div class="section-title" id="stages-heading">اختر المرحلة الدراسية:</div>
         <div class="grid-buttons">
             <div class="btn-card" onclick="selectStage('primary')" id="btn-primary">🎒 المرحلة الابتدائية</div>
             <div class="btn-card" onclick="selectStage('intermediate')" id="btn-intermediate">📚 المرحلة المتوسطة</div>
             <div class="btn-card" onclick="selectStage('secondary')" id="btn-secondary">🎓 المرحلة الثانوية (مسارات)</div>
         </div>
+    </div>
 
-        <div id="years-section" class="hidden">
-            <div class="section-title" id="years-heading">اختر السنة الدراسية:</div>
-            <div class="grid-buttons" id="years-grid"></div>
-        </div>
+    <!-- 2. شاشة السنوات الدراسية -->
+    <div id="years-screen" class="hidden">
+        <button class="back-btn" onclick="navigateTo('stages-screen')" id="back-to-stages">← اختيار مرحلة أخرى</button>
+        <div class="section-title" id="years-heading">اختر السنة الدراسية:</div>
+        <div class="grid-buttons" id="years-grid"></div>
+    </div>
 
-        <div id="terms-section" class="hidden">
-            <div class="section-title" id="terms-heading">اختر الفصل الدراسي:</div>
-            <div class="grid-buttons" id="terms-grid"></div>
-        </div>
+    <!-- 3. شاشة الفصول الدراسية (فصلين دراسيين فقط) -->
+    <div id="terms-screen" class="hidden">
+        <button class="back-btn" onclick="navigateTo('years-screen')" id="back-to-years">← اختيار سنة أخرى</button>
+        <div class="section-title" id="terms-heading">اختر الفصل الدراسي:</div>
+        <div class="grid-buttons" id="terms-grid"></div>
+    </div>
 
-        <div id="subjects-section" class="hidden">
-            <div class="section-title" id="subjects-heading">المواد الدراسية المتاحة:</div>
-            <div class="grid-buttons" id="subjects-grid"></div>
-        </div>
+    <!-- 4. شاشة المواد الدراسية -->
+    <div id="subjects-screen" class="hidden">
+        <button class="back-btn" onclick="navigateTo('terms-screen')" id="back-to-terms">← اختيار فصل آخر</button>
+        <div class="section-title" id="subjects-heading">المواد الدراسية المتاحة:</div>
+        <div class="grid-buttons" id="subjects-grid"></div>
+    </div>
 
-        <!-- واجهة البحث داخل كتاب المنهج -->
-        <div id="search-section" class="hidden">
-            <button class="btn-card" style="margin-bottom: 15px;" onclick="resetSelection()" id="back-select-btn">← رجوع لاختيار المادة</button>
-            <div class="section-title" id="search-heading">🤖 البحث الذكي الفائق في كتاب: <span id="selected-book-name" style="color: var(--primary);"></span></div>
-            
-            <div class="input-group">
-                <label id="label-query">اكتب سؤالك بوضوح تام:</label>
-                <input type="text" id="search-query" placeholder="مثال: ما هو قانون الجذب الكوني؟" required>
-            </div>
-            <button class="action-btn" onclick="executeSearch()" id="search-btn">بحث ذكي وتحليل دقيق 🔍</button>
+    <!-- 5. شاشة لوحة تحكم المادة المختارة (الخيارات الأربعة) -->
+    <div id="subject-dashboard-screen" class="hidden">
+        <button class="back-btn" onclick="navigateTo('subjects-screen')" id="back-to-subjects">← العودة لقائمة المواد</button>
+        <div class="section-title" id="dashboard-heading">المادة: <span id="current-subject-name" style="color: var(--primary);"></span></div>
+        <div class="grid-buttons">
+            <div class="btn-card" onclick="openSubjectOption('solved')" id="opt-solved">📖 الكتاب محلول</div>
+            <div class="btn-card" onclick="openSubjectOption('unsolved')" id="opt-unsolved">📘 الكتاب بدون حل</div>
+            <div class="btn-card" onclick="openSubjectOption('videos')" id="opt-videos">🎥 شرح الدروس</div>
+            <div class="btn-card" onclick="openSubjectOption('ai')" id="opt-ai" style="border-color: var(--accent); color: var(--accent);">🤖 المساعد الذكي لكتاب المادة</div>
         </div>
     </div>
 
-    <!-- عرض النتائج -->
+    <!-- 6. واجهة البحث الذكي داخل كتاب المادة -->
+    <div id="ai-search-screen" class="hidden">
+        <button class="back-btn" onclick="navigateTo('subject-dashboard-screen')" id="back-to-dashboard">← الرجوع لخيارات المادة</button>
+        <div class="section-title" id="ai-search-heading">🤖 المساعد الذكي لكتاب: <span id="ai-book-title" style="color: var(--primary);"></span></div>
+        <div class="input-group">
+            <label id="label-query">اكتب سؤالك بوضوح تام:</label>
+            <input type="text" id="search-query" placeholder="مثال: ما هو قانون الجذب الكوني؟" required>
+        </div>
+        <button class="action-btn" onclick="executeSearch()" id="search-btn">بحث ذكي وتحليل دقيق 🔍</button>
+    </div>
+
+    <!-- عرض نتائج البحث والتثبت -->
     <div id="result-container" class="result-box hidden">
         <h3 id="result-heading" style="color: var(--primary); margin-top:0;">🎯 النتيجة والتحليل الذكي:</h3>
-        <p><strong>رقم الصفحة:</strong> <span id="result-page"></span></p>
-        <p><strong>الإجابة:</strong> <span id="result-answer"></span></p>
-        <div id="image-container">
-            <h4>الصفحة المحددة من الكتاب:</h4>
+        <p><strong id="label-page-num">رقم الصفحة:</strong> <span id="result-page"></span></p>
+        <p><strong id="label-answer-text">الإجابة:</strong> <span id="result-answer"></span></p>
+        <div id="image-container" class="hidden">
+            <h4 id="label-page-image">الصفحة المحددة من الكتاب:</h4>
             <img id="result-image" class="page-preview" src="" alt="صفحة الكتاب">
         </div>
     </div>
@@ -448,7 +487,14 @@ def index():
     let currentStage = '';
     let currentYear = '';
     let currentTerm = '';
-    let selectedBookCode = '';
+    let selectedSubject = '';
+    let selectedBookCode = 'physics2_t1';
+
+    const screens = [
+        'stages-screen', 'years-screen', 'terms-screen', 
+        'subjects-screen', 'subject-dashboard-screen', 
+        'ai-search-screen', 'custom-pdf-screen'
+    ];
 
     const translations = {
         ar: {
@@ -460,20 +506,31 @@ def index():
             btnIntermediate: "📚 المرحلة المتوسطة",
             btnSecondary: "🎓 المرحلة الثانوية (مسارات)",
             yearsHeading: "اختر السنة الدراسية:",
-            termsHeading: "اختر الفصل الدراسي:",
+            termsHeading: "اختر الفصل الدراسي (نظام الفصلين):",
             subjectsHeading: "المواد الدراسية المتاحة:",
-            searchHeading: "🤖 البحث الذكي الفائق في كتاب: ",
+            dashboardHeading: "المادة: ",
+            aiSearchHeading: "🤖 المساعد الذكي لكتاب: ",
             labelQuery: "اكتب سؤالك بوضوح تام:",
             searchBtn: "بحث ذكي وتحليل دقيق 🔍",
-            backSelectBtn: "← رجوع لاختيار المادة",
-            backHomeBtn: "← العودة للمراحل الدراسية",
+            backStagesBtn: "← العودة للمراحل الدراسية",
+            backToStages: "← اختيار مرحلة أخرى",
+            backToYears: "← اختيار سنة أخرى",
+            backToTerms: "← اختيار فصل آخر",
+            backToSubjects: "← العودة لقائمة المواد",
+            backToDashboard: "← الرجوع لخيارات المادة",
             customUploadHeading: "ارفق كتابك الخاص (PDF) ووجّه سؤالك:",
             labelChooseFile: "اختر ملف الـ PDF:",
             labelCustomQuery: "اكتب سؤالك بوضوح تام:",
             customSubmitBtn: "تحليل المستند واستخراج الإجابة 🔍",
+            optSolved: "📖 الكتاب محلول",
+            optUnsolved: "📘 الكتاب بدون حل",
+            optVideos: "🎥 شرح الدروس",
+            optAi: "🤖 المساعد الذكي لكتاب المادة",
+            labelPageNum: "رقم الصفحة:",
+            labelAnswerText: "الإجابة:",
+            labelPageImage: "الصفحة المحددة من الكتاب:",
             term1: "الفصل الدراسي الأول",
             term2: "الفصل الدراسي الثاني",
-            term3: "الفصل الدراسي الثالث",
             year1: "الصف الأول", year2: "الصف الثاني", year3: "الصف الثالث",
             year4: "الصف الرابع", year5: "الصف الخامس", year6: "الصف السادس",
             yearSec1: "السنة الأولى المشتركة", yearSec2: "السنة الثانية", yearSec3: "السنة الثالثة"
@@ -487,20 +544,31 @@ def index():
             btnIntermediate: "📚 Middle School",
             btnSecondary: "🎓 High School (Tracks)",
             yearsHeading: "Select Academic Year:",
-            termsHeading: "Select Term:",
+            termsHeading: "Select Term (2-Semester System):",
             subjectsHeading: "Available Subjects:",
-            searchHeading: "🤖 AI Search in Book: ",
+            dashboardHeading: "Subject: ",
+            aiSearchHeading: "🤖 AI Assistant for: ",
             labelQuery: "Write your question clearly:",
             searchBtn: "Smart Search & Analyze 🔍",
-            backSelectBtn: "← Back to Subject Selection",
-            backHomeBtn: "← Back to Educational Stages",
+            backStagesBtn: "← Back to Educational Stages",
+            backToStages: "← Select Another Stage",
+            backToYears: "← Select Another Year",
+            backToTerms: "← Select Another Term",
+            backToSubjects: "← Back to Subjects List",
+            backToDashboard: "← Back to Subject Options",
             customUploadHeading: "Upload your custom PDF book & ask a question:",
             labelChooseFile: "Select PDF File:",
             labelCustomQuery: "Write your question clearly:",
             customSubmitBtn: "Analyze Document & Extract Answer 🔍",
-            term1: "First Term",
-            term2: "Second Term",
-            term3: "Third Term",
+            optSolved: "📖 Solved Book",
+            optUnsolved: "📘 Unsolved Book",
+            optVideos: "🎥 Video Lessons",
+            optAi: "🤖 AI-Powered Book Assistant",
+            labelPageNum: "Page Number:",
+            labelAnswerText: "Answer:",
+            labelPageImage: "Selected Book Page:",
+            term1: "First Semester",
+            term2: "Second Semester",
             year1: "Grade 1", year2: "Grade 2", year3: "Grade 3",
             year4: "Grade 4", year5: "Grade 5", year6: "Grade 6",
             yearSec1: "First Common Year", yearSec2: "Second Year", yearSec3: "Third Year"
@@ -511,25 +579,41 @@ def index():
         primary: {
             years: [1, 2, 3, 4, 5, 6],
             subjects: {
-                ar: ["القرآن الكريم", "التربية الإسلامية", "لغتي", "الرياضيات", "العلوم", "الدراسات الاجتماعية", "المهارات الرقمية", "التربية الفنية", "التربية البدنية"],
-                en: ["Holy Quran", "Islamic Studies", "My Language (Arabic)", "Mathematics", "Science", "Social Studies", "Digital Skills", "Art Education", "Physical Education"]
+                ar: ["القرآن الكريم", "التربية الإسلامية", "لغتي", "الرياضيات", "العلوم", "الدراسات الاجتماعية", "المهارات الرقمية", "التربية الفنية"],
+                en: ["Holy Quran", "Islamic Studies", "My Language", "Mathematics", "Science", "Social Studies", "Digital Skills", "Art Education"]
             }
         },
         intermediate: {
             years: [1, 2, 3],
             subjects: {
-                ar: ["القرآن والتفسير", "الحديث والسيرة", "التوحيد والفقه", "لغتي الخالدة", "اللغة الإنجليزية", "الرياضيات", "العلوم", "الدراسات الاجتماعية", "المهارات الرقمية", "التربية الفنية"],
-                en: ["Quran & Tafseer", "Hadith & Seerah", "Islamic Faith & Fiqh", "Arabic Language", "English Language", "Mathematics", "Science", "Social Studies", "Digital Skills", "Art Education"]
+                ar: ["القرآن والتفسير", "الحديث والسيرة", "التوحيد والفقه", "لغتي الخالدة", "اللغة الإنجليزية", "الرياضيات", "العلوم", "الدراسات الاجتماعية"],
+                en: ["Quran & Tafseer", "Hadith & Seerah", "Islamic Faith & Fiqh", "Arabic Language", "English Language", "Mathematics", "Science", "Social Studies"]
             }
         },
         secondary: {
             years: [1, 2, 3],
             subjects: {
-                ar: ["الفيزياء 2", "الكيمياء", "الأحياء", "الرياضيات 2", "التقنية الرقمية", "الدراسات الاجتماعية", "اللغة الإنجليزية", "التفكير النقدي", "اللياقة والثقافة الصحية"],
-                en: ["Physics 2", "Chemistry", "Biology", "Mathematics 2", "Digital Technology", "Social Studies", "English Language", "Critical Thinking", "Fitness & Health Culture"]
+                ar: ["الفيزياء 2", "الكيمياء", "الأحياء", "الرياضيات 2", "التقنية الرقمية", "الدراسات الاجتماعية", "اللغة الإنجليزية", "التفكير النقدي"],
+                en: ["Physics 2", "Chemistry", "Biology", "Mathematics 2", "Digital Technology", "Social Studies", "English Language", "Critical Thinking"]
             }
         }
     };
+
+    function navigateTo(screenId) {
+        screens.forEach(s => {
+            const el = document.getElementById(s);
+            if (el) el.classList.add('hidden');
+        });
+        document.getElementById(screenId).classList.remove('hidden');
+        
+        if (screenId === 'custom-pdf-screen') {
+            document.getElementById('banner-area').classList.add('hidden');
+        } else {
+            document.getElementById('banner-area').classList.remove('hidden');
+        }
+        
+        document.getElementById('result-container').classList.add('hidden');
+    }
 
     function toggleLanguage() {
         currentLang = currentLang === 'ar' ? 'en' : 'ar';
@@ -549,96 +633,91 @@ def index():
         document.getElementById('subjects-heading').innerText = t.subjectsHeading;
         document.getElementById('label-query').innerText = t.labelQuery;
         document.getElementById('search-btn').innerText = t.searchBtn;
-        document.getElementById('back-select-btn').innerText = t.backSelectBtn;
-        document.getElementById('back-home-btn').innerText = t.backHomeBtn;
+        document.getElementById('back-stages-btn').innerText = t.backStagesBtn;
+        document.getElementById('back-to-stages').innerText = t.backToStages;
+        document.getElementById('back-to-years').innerText = t.backToYears;
+        document.getElementById('back-to-terms').innerText = t.backToTerms;
+        document.getElementById('back-to-subjects').innerText = t.backToSubjects;
+        document.getElementById('back-to-dashboard').innerText = t.backToDashboard;
         document.getElementById('custom-upload-heading').innerText = t.customUploadHeading;
         document.getElementById('label-choose-file').innerText = t.labelChooseFile;
         document.getElementById('label-custom-query').innerText = t.labelCustomQuery;
         document.getElementById('custom-submit-btn').innerText = t.customSubmitBtn;
+        document.getElementById('opt-solved').innerText = t.optSolved;
+        document.getElementById('opt-unsolved').innerText = t.optUnsolved;
+        document.getElementById('opt-videos').innerText = t.optVideos;
+        document.getElementById('opt-ai').innerText = t.optAi;
+        document.getElementById('label-page-num').innerText = t.labelPageNum;
+        document.getElementById('label-answer-text').innerText = t.labelAnswerText;
+        document.getElementById('label-page-image').innerText = t.labelPageImage;
 
         if (currentStage) selectStage(currentStage);
     }
 
     function selectStage(stage) {
         currentStage = stage;
-        document.getElementById('years-section').classList.remove('hidden');
-        document.getElementById('terms-section').classList.add('hidden');
-        document.getElementById('subjects-section').classList.add('hidden');
-        document.getElementById('search-section').classList.add('hidden');
-
         const yearsGrid = document.getElementById('years-grid');
         yearsGrid.innerHTML = '';
         
-        const yearsList = subjectsData[stage].years;
-        yearsList.forEach(yr => {
-            let label = "";
-            if (stage === 'secondary') {
-                label = translations[currentLang][`yearSec${yr}`];
-            } else {
-                label = translations[currentLang][`year${yr}`];
-            }
+        subjectsData[stage].years.forEach(yr => {
+            const label = stage === 'secondary' ? translations[currentLang][`yearSec${yr}`] : translations[currentLang][`year${yr}`];
             const btn = document.createElement('div');
             btn.className = 'btn-card';
             btn.innerText = label;
             btn.onclick = () => selectYear(yr);
             yearsGrid.appendChild(btn);
         });
+
+        navigateTo('years-screen');
     }
 
     function selectYear(yr) {
         currentYear = yr;
-        document.getElementById('terms-section').classList.remove('hidden');
-        document.getElementById('subjects-section').classList.add('hidden');
-        
         const termsGrid = document.getElementById('terms-grid');
         termsGrid.innerHTML = '';
-        [1, 2, 3].forEach(term => {
+        
+        // فصلين دراسيين فقط
+        [1, 2].forEach(term => {
             const btn = document.createElement('div');
             btn.className = 'btn-card';
             btn.innerText = translations[currentLang][`term${term}`];
             btn.onclick = () => selectTerm(term);
             termsGrid.appendChild(btn);
         });
+
+        navigateTo('terms-screen');
     }
 
     function selectTerm(term) {
         currentTerm = term;
-        document.getElementById('subjects-section').classList.remove('hidden');
-        
         const subjectsGrid = document.getElementById('subjects-grid');
         subjectsGrid.innerHTML = '';
         const list = subjectsData[currentStage].subjects[currentLang];
 
-        list.forEach((sub, idx) => {
+        list.forEach(sub => {
             const btn = document.createElement('div');
             btn.className = 'btn-card';
             btn.innerText = sub;
-            btn.onclick = () => selectBook(sub, `physics2_t1`);
+            btn.onclick = () => selectSubject(sub);
             subjectsGrid.appendChild(btn);
         });
+
+        navigateTo('subjects-screen');
     }
 
-    function selectBook(bookName, code) {
-        selectedBookCode = code;
-        document.getElementById('selected-book-name').innerText = bookName;
-        document.getElementById('search-section').classList.remove('hidden');
+    function selectSubject(subjectName) {
+        selectedSubject = subjectName;
+        document.getElementById('current-subject-name').innerText = subjectName;
+        navigateTo('subject-dashboard-screen');
     }
 
-    function resetSelection() {
-        document.getElementById('search-section').classList.add('hidden');
-        document.getElementById('result-container').classList.add('hidden');
-    }
-
-    function showCustomPDFScreen() {
-        document.getElementById('main-curriculum-screen').classList.add('hidden');
-        document.getElementById('custom-pdf-screen').classList.remove('hidden');
-        document.getElementById('result-container').classList.add('hidden');
-    }
-
-    function goBackToHome() {
-        document.getElementById('custom-pdf-screen').classList.add('hidden');
-        document.getElementById('main-curriculum-screen').classList.remove('hidden');
-        document.getElementById('result-container').classList.add('hidden');
+    function openSubjectOption(optionType) {
+        if (optionType === 'ai') {
+            document.getElementById('ai-book-title').innerText = selectedSubject;
+            navigateTo('ai-search-screen');
+        } else {
+            alert(currentLang === 'ar' ? `جاري فتح قسم (${optionType}) لمادة ${selectedSubject}...` : `Opening ${optionType} for ${selectedSubject}...`);
+        }
     }
 
     async function executeSearch() {
@@ -648,10 +727,11 @@ def index():
         const resBox = document.getElementById('result-container');
         resBox.classList.remove('hidden');
         document.getElementById('image-container').classList.add('hidden');
+        
         document.getElementById('result-answer').innerHTML = `
             <div class="spinner-container">
                 <div class="spinner"></div>
-                <div style="color: var(--primary); font-weight: bold;">${currentLang === 'ar' ? 'جاري البحث والتحليل الذكي...' : 'Analyzing...'}</div>
+                <div style="color: var(--primary); font-weight: bold;">${currentLang === 'ar' ? 'جاري البحث والتحليل الذكي بالسيرفر...' : 'Analyzing document...'}</div>
             </div>
         `;
 
@@ -661,7 +741,12 @@ def index():
             if (resp.ok) {
                 document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
-                document.getElementById('result-answer').innerHTML = data.answer.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
+                
+                let answerHtml = data.answer;
+                if (data.highlight) {
+                    answerHtml = answerHtml.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
+                }
+                document.getElementById('result-answer').innerHTML = answerHtml;
                 document.getElementById('result-image').src = data.page_image;
             } else {
                 document.getElementById('result-answer').innerText = data.error_ar || data.error;
@@ -687,7 +772,6 @@ def index():
         resBox.classList.remove('hidden');
         document.getElementById('image-container').classList.add('hidden');
         
-        // عرض دائرة التحميل المتحركة مع رسالة نجاح الإرفاق
         document.getElementById('result-answer').innerHTML = `
             <div style="color: #059669; font-weight: bold; margin-bottom: 8px; text-align: center;">
                 ✅ تم إرفاق المستند (${fileName}) بنجاح!
@@ -707,7 +791,12 @@ def index():
             if (resp.ok) {
                 document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
-                document.getElementById('result-answer').innerText = data.answer;
+                
+                let answerHtml = data.answer;
+                if (data.highlight) {
+                    answerHtml = answerHtml.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
+                }
+                document.getElementById('result-answer').innerHTML = answerHtml;
                 document.getElementById('result-image').src = data.page_image;
             } else {
                 document.getElementById('result-answer').innerText = data.error || "تعذر تحليل الملف.";

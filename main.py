@@ -2,11 +2,9 @@ import os
 from pypdf import PdfReader
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# التأكد من وجود مجلد الكتب
 os.makedirs("books", exist_ok=True)
 
 HTML_CONTENT = """
@@ -18,41 +16,59 @@ HTML_CONTENT = """
     <title>منصة المنهج الذكي | Smart Curriculum Platform</title>
     <style>
         :root {
-            --primary: #2563eb;
-            --primary-hover: #1d4ed8;
-            --bg-color: #f8fafc;
-            --card-bg: #ffffff;
-            --text-main: #1e293b;
-            --text-muted: #64748b;
-            --border-color: #e2e8f0;
-            --accent-red: #ef4444;
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --accent-glow: rgba(79, 70, 229, 0.3);
+            --bg-gradient: linear-gradient(135deg, #0f172a 0%, #1e1b4b 50%, #312e81 100%);
+            --card-bg: rgba(255, 255, 255, 0.95);
+            --text-main: #0f172a;
+            --text-muted: #475569;
+            --border-color: rgba(226, 232, 240, 0.8);
+            --accent-red: #f43f5e;
             --accent-green: #10b981;
         }
 
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: var(--bg-color);
+            background: var(--bg-gradient);
             color: var(--text-main);
             margin: 0;
             padding: 20px;
-            line-height: 1.6;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
         }
 
         .container {
+            width: 100%;
             max-width: 950px;
-            margin: 0 auto;
-            background: var(--card-bg);
+            background: rgba(255, 255, 255, 0.92);
+            backdrop-filter: blur(20px);
             padding: 40px;
-            border-radius: 20px;
-            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.05);
+            border-radius: 28px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
+            border: 1px solid rgba(255, 255, 255, 0.5);
             position: relative;
+            overflow: hidden;
+            box-sizing: border-box;
+        }
+
+        .container::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 100%;
+            height: 6px;
+            background: linear-gradient(90deg, #4f46e5, #06b6d4, #10b981);
         }
 
         .header-flex {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            border-bottom: 2px solid var(--border-color);
+            border-bottom: 2px solid #e2e8f0;
             padding-bottom: 20px;
             margin-bottom: 30px;
         }
@@ -60,69 +76,75 @@ HTML_CONTENT = """
         h2 {
             color: var(--primary);
             margin: 0;
-            font-size: 26px;
+            font-size: 28px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
         }
 
         .lang-btn {
             background: #f1f5f9;
             color: var(--text-muted);
-            border: 1px solid var(--border-color);
+            border: 1px solid #cbd5e1;
             padding: 8px 16px;
-            border-radius: 8px;
+            border-radius: 10px;
             cursor: pointer;
-            font-weight: 600;
-            transition: all 0.2s;
+            font-weight: 700;
+            transition: all 0.3s ease;
         }
 
         .lang-btn:hover {
-            background: var(--border-color);
-            color: var(--text-main);
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+            box-shadow: 0 4px 12px var(--accent-glow);
         }
 
         .section-title {
             font-size: 20px;
-            font-weight: 700;
-            margin: 30px 0 15px 0;
+            font-weight: 800;
+            margin: 35px 0 18px 0;
             color: var(--text-main);
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
         }
 
         .section-title::before {
             content: '';
-            width: 6px;
-            height: 22px;
+            width: 8px;
+            height: 24px;
             background: var(--primary);
-            border-radius: 4px;
+            border-radius: 6px;
         }
 
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 15px;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 18px;
             margin-bottom: 25px;
         }
 
         .card {
             background: #ffffff;
             border: 2px solid var(--border-color);
-            border-radius: 14px;
-            padding: 18px;
+            border-radius: 18px;
+            padding: 20px;
             text-align: center;
             cursor: pointer;
-            transition: all 0.25s ease;
-            font-weight: 600;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            font-weight: 700;
+            font-size: 16px;
             color: var(--text-main);
-            box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02);
+            position: relative;
         }
 
         .card:hover {
             border-color: var(--primary);
-            background: #eff6ff;
+            background: linear-gradient(135deg, #ffffff 0%, #e0e7ff 100%);
             color: var(--primary);
-            transform: translateY(-3px);
-            box-shadow: 0 6px 15px rgba(37, 99, 235, 0.1);
+            transform: translateY(-5px);
+            box-shadow: 0 12px 25px -5px var(--accent-glow);
         }
 
         .hidden {
@@ -130,77 +152,85 @@ HTML_CONTENT = """
         }
 
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 22px;
         }
 
         label {
-            font-weight: 600;
+            font-weight: 700;
             display: block;
             margin-bottom: 8px;
             color: var(--text-main);
+            font-size: 15px;
         }
 
         input[type="text"], input[type="number"] {
             width: 100%;
-            padding: 14px;
-            border: 2px solid var(--border-color);
-            border-radius: 10px;
+            padding: 15px;
+            border: 2px solid #cbd5e1;
+            border-radius: 12px;
             box-sizing: border-box;
-            font-size: 15px;
+            font-size: 16px;
             background: #f8fafc;
+            transition: all 0.3s;
+        }
+
+        input:focus {
+            border-color: var(--primary);
+            background: #fff;
+            box-shadow: 0 0 0 4px var(--accent-glow);
+            outline: none;
         }
 
         button.action-btn {
             width: 100%;
-            padding: 14px;
-            background-color: var(--primary);
+            padding: 15px;
+            background: linear-gradient(135deg, #4f46e5 0%, #4338ca 100%);
             color: white;
             border: none;
-            border-radius: 10px;
-            font-weight: bold;
+            border-radius: 12px;
+            font-weight: 800;
             cursor: pointer;
-            font-size: 16px;
-            transition: background-color 0.2s;
+            font-size: 17px;
+            transition: all 0.3s;
+            box-shadow: 0 4px 15px var(--accent-glow);
         }
 
         button.action-btn:hover {
-            background-color: var(--primary-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px var(--accent-glow);
         }
 
         .back-btn {
-            background-color: #64748b !important;
-            margin-top: 10px;
-        }
-        .back-btn:hover {
-            background-color: #475569 !important;
+            background: linear-gradient(135deg, #64748b 0%, #475569 100%) !important;
+            box-shadow: 0 4px 15px rgba(100, 116, 139, 0.3) !important;
+            margin-top: 15px;
         }
 
-        /* شاشة التحميل العصرية */
         #loadingOverlay {
             position: absolute;
             top: 0;
             left: 0;
             width: 100%;
             height: 100%;
-            background: rgba(255, 255, 255, 0.85);
-            backdrop-filter: blur(4px);
+            background: rgba(15, 23, 42, 0.85);
+            backdrop-filter: blur(8px);
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             z-index: 1000;
-            border-radius: 20px;
+            border-radius: 28px;
             display: none;
         }
 
         .spinner {
-            width: 50px;
-            height: 50px;
-            border: 5px solid #e2e8f0;
-            border-top: 5px solid var(--primary);
+            width: 60px;
+            height: 60px;
+            border: 6px solid rgba(255, 255, 255, 0.1);
+            border-top: 6px solid #6366f1;
             border-radius: 50%;
-            animation: spin 1s linear infinite;
-            margin-bottom: 15px;
+            animation: spin 0.9s cubic-bezier(0.68, -0.55, 0.265, 1.55) infinite;
+            margin-bottom: 20px;
         }
 
         @keyframes spin {
@@ -209,40 +239,27 @@ HTML_CONTENT = """
         }
 
         .loading-text {
-            font-weight: 700;
-            color: var(--primary);
-            font-size: 18px;
+            font-weight: 800;
+            color: #ffffff;
+            font-size: 20px;
+            letter-spacing: 0.5px;
         }
 
-        /* صندوق النتائج مع الإطار الأحمر الاحترافي */
         .result-box {
-            margin-top: 30px;
+            margin-top: 35px;
             padding: 30px;
-            background: #fff;
-            border-radius: 16px;
+            background: #ffffff;
+            border-radius: 20px;
             border: 4px solid var(--accent-red);
-            box-shadow: 0 10px 30px rgba(239, 68, 68, 0.15);
+            box-shadow: 0 15px 35px rgba(244, 63, 94, 0.2);
             display: none;
             position: relative;
         }
 
-        .result-box::before {
-            content: 'الإجابة الدقيقة محددة في الإطار الأحمر أدناه';
-            position: absolute;
-            top: -16px;
-            right: 20px;
-            background: var(--accent-red);
-            color: white;
-            padding: 4px 14px;
-            font-size: 13px;
-            font-weight: bold;
-            border-radius: 6px;
-        }
-
         .ai-section {
-            margin-top: 35px;
-            border-top: 2px dashed var(--border-color);
-            padding-top: 30px;
+            margin-top: 40px;
+            border-top: 2px dashed #cbd5e1;
+            padding-top: 35px;
         }
     </style>
 </head>
@@ -281,7 +298,7 @@ HTML_CONTENT = """
         <div class="grid">
             <div class="card" onclick="selectGrade('أولى ثانوي')">🎓 أولى ثانوي</div>
             <div class="card" onclick="selectGrade('ثاني ثانوي (مسارات)')">🎓 ثاني ثانوي (مسارات)</div>
-            <div class="card" onclick="select ثانوي')">🎓 ثالث ثانوي</div>
+            <div class="card" onclick="selectGrade('ثالث ثانوي')">🎓 ثالث ثانوي</div>
         </div>
     </div>
 
@@ -314,7 +331,7 @@ HTML_CONTENT = """
         <button class="action-btn back-btn" onclick="goBackToSubject()">⬅ رجوع لاختيار المادة</button>
     </div>
 
-    <!-- الخطوة 5: البحث الذكي الفائق مع الإطار الأحمر -->
+    <!-- الخطوة 5: البحث الذكي الفائق -->
     <div id="aiSection" class="hidden ai-section">
         <h3 style="color: var(--primary); margin-top: 0;" id="aiSearchTitle">🤖 البحث الذكي الفائق في الكتاب</h3>
         
@@ -335,10 +352,10 @@ HTML_CONTENT = """
         <button class="action-btn" onclick="searchBook()">بحث ذكي وتحليل دقيق 🔍</button>
 
         <div id="resultBox" class="result-box">
-            <p id="answerText" style="font-size: 17px; font-weight: 600; line-height: 1.9; color: #1e293b; background: #f8fafc; padding: 18px; border-radius: 10px; border-right: 5px solid var(--accent-red);"></p>
-            <div style="margin-top: 15px; display: flex; justify-content: space-between; align-items: center;">
+            <p id="answerText" style="font-size: 17px; font-weight: 600; line-height: 1.9; color: #1e293b; background: #f8fafc; padding: 18px; border-radius: 12px; border-right: 5px solid var(--accent-red);"></p>
+            <div style="margin-top: 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
                 <span id="pageText" style="font-weight: bold; color: #dc2626; font-size: 15px;"></span>
-                <a id="viewFullPageBtn" href="#" target="_blank" style="background: var(--primary); color: white; padding: 8px 16px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 14px;">📄 فتح الصفحة كاملة في الكتاب</a>
+                <a id="viewFullPageBtn" href="#" target="_blank" style="background: var(--primary); color: white; padding: 10px 18px; border-radius: 10px; text-decoration: none; font-weight: bold; font-size: 14px; display: none; box-shadow: 0 4px 12px var(--accent-glow);">📄 فتح الصفحة كاملة في الكتاب</a>
             </div>
         </div>
     </div>
@@ -488,9 +505,9 @@ async function searchBook() {
         } else {
             document.getElementById('answerText').innerText = "📌 " + data.extracted_text;
             document.getElementById('pageText').innerText = `📄 رقم الصفحة الفعلية في الكتاب: ${data.page_number}`;
-            // توجيه الطالب مباشرة لفتح الصفحة المعنية داخل الكتاب
-            document.getElementById('viewFullPageBtn.style.display = 'inline-block';
-            document.getElementById('viewFullPageBtn').href = `/view-book/${currentCleanFile}#page=${data.page_number}`;
+            const fullPageBtn = document.getElementById('viewFullPageBtn');
+            fullPageBtn.style.display = 'inline-block';
+            fullPageBtn.href = `/view-book/${currentCleanFile}#page=${data.page_number}`;
         }
     } catch (err) {
         hideLoading();
@@ -536,7 +553,6 @@ async def search_book(book_name: str, query: str, offset: int = 0):
     matched_text = ""
     found_page = 1
     
-    # خوارزمية ذكية لتحليل الكلمات المفتاحية ومطابقتها بأعلى دقة
     keywords = [kw.strip() for kw in query.split() if len(kw.strip()) > 2]
     if not keywords:
         keywords = query.split()
@@ -549,7 +565,6 @@ async def search_book(book_name: str, query: str, offset: int = 0):
         if score > best_match_score:
             best_match_score = score
             found_page = (page_num + 1) + offset
-            # استخراج النص الأقرب للإجابة بدقة
             lines = text.split('\n')
             relevant_lines = [line for line in lines if any(kw in line for kw in keywords)]
             if relevant_lines:

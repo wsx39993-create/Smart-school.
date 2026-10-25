@@ -51,7 +51,6 @@ def render_page_with_highlight(doc: fitz.Document, page_num: int, highlight_text
     if highlight_text:
         text_instances = page.search_for(highlight_text)
         for inst in text_instances:
-            # إضافة إبراز أحمر ناصع حول النص المحدد
             page.draw_rect(inst, color=(1, 0, 0), fill=(1, 0.8, 0.8), overlay=True)
 
     pix = page.get_pixmap(dpi=150)
@@ -118,7 +117,6 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
         contents = await file.read()
         doc = fitz.open(stream=contents, filetype="pdf")
         
-        # البحث في أفضل صفحة مطابقة
         keywords = [k.strip() for k in query.split() if len(k.strip()) > 2]
         best_page_idx = 0
         max_score = -1
@@ -338,6 +336,28 @@ def index():
             border-radius: 12px;
             border: 2px solid #cbd5e1;
             margin-top: 15px;
+        }
+
+        /* تنسيق دائرة التحميل (Spinner) */
+        .spinner-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .spinner {
+            width: 45px;
+            height: 45px;
+            border: 5px solid #e2e8f0;
+            border-top: 5px solid var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-bottom: 12px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
     </style>
 </head>
@@ -627,12 +647,19 @@ def index():
 
         const resBox = document.getElementById('result-container');
         resBox.classList.remove('hidden');
-        document.getElementById('result-answer').innerText = currentLang === 'ar' ? "جاري البحث والتحليل الذكي..." : "Analyzing...";
+        document.getElementById('image-container').classList.add('hidden');
+        document.getElementById('result-answer').innerHTML = `
+            <div class="spinner-container">
+                <div class="spinner"></div>
+                <div style="color: var(--primary); font-weight: bold;">${currentLang === 'ar' ? 'جاري البحث والتحليل الذكي...' : 'Analyzing...'}</div>
+            </div>
+        `;
 
         try {
             const resp = await fetch(`/api/search?book_code=${selectedBookCode}&query=${encodeURIComponent(q)}`);
             const data = await resp.json();
             if (resp.ok) {
+                document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
                 document.getElementById('result-answer').innerHTML = data.answer.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
                 document.getElementById('result-image').src = data.page_image;
@@ -651,13 +678,25 @@ def index():
 
         if (!fileInput.files[0]) return;
 
+        const fileName = fileInput.files[0].name;
         const formData = new FormData();
         formData.append('file', fileInput.files[0]);
         formData.append('query', queryInput.value);
 
         const resBox = document.getElementById('result-container');
         resBox.classList.remove('hidden');
-        document.getElementById('result-answer').innerText = currentLang === 'ar' ? "جاري رفع وقراءة ملف الـ PDF الخاص بك بالذكاء الاصطناعي..." : "Processing custom PDF...";
+        document.getElementById('image-container').classList.add('hidden');
+        
+        // عرض دائرة التحميل المتحركة مع رسالة نجاح الإرفاق
+        document.getElementById('result-answer').innerHTML = `
+            <div style="color: #059669; font-weight: bold; margin-bottom: 8px; text-align: center;">
+                ✅ تم إرفاق المستند (${fileName}) بنجاح!
+            </div>
+            <div class="spinner-container">
+                <div class="spinner"></div>
+                <div style="color: var(--primary); font-weight: bold;">${currentLang === 'ar' ? 'جاري قراءة وتحليل ملف الـ PDF بالذكاء الاصطناعي...' : 'Processing custom PDF...'}</div>
+            </div>
+        `;
 
         try {
             const resp = await fetch('/api/custom-pdf-search', {
@@ -666,6 +705,7 @@ def index():
             });
             const data = await resp.json();
             if (resp.ok) {
+                document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
                 document.getElementById('result-answer').innerText = data.answer;
                 document.getElementById('result-image').src = data.page_image;

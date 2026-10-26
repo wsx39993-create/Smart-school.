@@ -1,14 +1,12 @@
 import os
-import io
 import fitz  # PyMuPDF
 import base64
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 
-# تم وضع مفتاحك الخاص مباشرة هنا ليعمل التطبيق بدون أي أخطاء
+# التهيئة بالطريقة الصحيحة 100% للمكتبة الحديثة
 client = genai.Client(api_key="AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg")
 
 app = FastAPI(title="Smart Curriculum Educational Platform")
@@ -51,52 +49,34 @@ def render_page_with_highlight(doc: fitz.Document, page_num: int, highlight_text
     return f"data:image/png;base64,{encoded}"
 
 @app.get("/api/search")
-def search_in_book(book_code: str = Query(...), query: str = Query(...)):
+def search_in_book(book_code: str, query: str):
     filename = f"{book_code}.pdf"
     pdf_path = os.path.join(BOOKS_DIR, filename)
 
     if not os.path.exists(pdf_path):
-        return JSONResponse(
-            status_code=404,
-            content={"error_ar": "عذراً، الكتاب غير متوفر حالياً في المكتبة الرقمية.",
-                      "error_en": "Sorry, this book is currently not available in the digital library."}
-        )
+        return JSONResponse(status_code=404, content={"error_ar": "الكتاب غير متوفر"})
 
     try:
         doc = fitz.open(pdf_path)
         top_pages = search_pdf_text(pdf_path, query)
         best_page_idx = top_pages[0]
         page = doc[best_page_idx]
+        text_content = page.get_text()
 
-        pix = page.get_pixmap(dpi=120)
-        img_bytes = pix.tobytes("png")
-
-        prompt = (
-            f"أنت معلم وخبير في المناهج الدراسية. بناءً على صفحة الكتاب المرفقة، أجب بدقة على السؤال التالي: '{query}'.\n"
-            f"إذا وجدت الإجابة في الصفحة، حدد النص الدقيق المستخرج للإجابة في السطر الأخير مسبوقاً بـ 'EXACT_TEXT:'."
-        )
-
+        prompt = f"بناءً على نص الصفحة التالي، أجب عن السؤال بدقة: {query}\n\nالنص:\n{text_content[:3000]}"
+        
+        # الاستدعاء الصحيح للنموذج باللغة الحديثة
         response = client.models.generate_content(
             model="gemini-1.5-flash",
-            contents=[
-                prompt,
-                {"mime_type": "image/png", "data": img_bytes}
-            ]
+            contents=prompt,
         )
 
-        answer_text = response.text if response.text else "لم يتم العثور على إجابة واضحة."
-        highlight_str = ""
-        if "EXACT_TEXT:" in answer_text:
-            parts = answer_text.split("EXACT_TEXT:")
-            answer_text = parts[0].strip()
-            highlight_str = parts[1].strip()
-
-        img_b64 = render_page_with_highlight(doc, best_page_idx, highlight_str)
+        img_b64 = render_page_with_highlight(doc, best_page_idx)
 
         return {
             "page_number": best_page_idx + 1,
-            "answer": answer_text,
-            "highlight": highlight_str,
+            "answer": response.text,
+            "highlight": "",
             "page_image": img_b64
         }
     except Exception as e:
@@ -104,55 +84,27 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
 
 @app.post("/api/custom-pdf-search")
 async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)):
-    if not file.filename.endswith('.pdf'):
-        return JSONResponse(status_code=400, content={"error": "يجب أن يكون الملف بصيغة PDF فقط."})
-    
     try:
         contents = await file.read()
         doc = fitz.open(stream=contents, filetype="pdf")
         
-        keywords = [k.strip() for k in query.split() if len(k.strip()) > 2]
         best_page_idx = 0
-        max_score = -1
+        text_content = doc[0].get_text() if len(doc) > 0 else ""
 
-        search_limit = min(len(doc), 60)
-        for page_idx in range(search_limit):
-            text = doc[page_idx].get_text("text")
-            score = sum(1 for kw in keywords if kw.lower() in text.lower())
-            if score > max_score:
-                max_score = score
-                best_page_idx = page_idx
-
-        page = doc[best_page_idx]
-        pix = page.get_pixmap(dpi=120)
-        img_bytes = pix.tobytes("png")
-
-        prompt = (
-            f"بناءً على صفحة المستند المرفقة، أجب على السؤال التالي: '{query}'.\n"
-            f"في نهاية إجابتك أضف سطر جديد مكتوب فيه EXACT_TEXT: متبوعاً بالجملة أو النص الدقيق المحدد للإجابة من الصفحة."
-        )
-
+        prompt = f"بناءً على المستند المرفق، أجب عن السؤال بدقة: {query}\n\nالنص:\n{text_content[:3000]}"
+        
+        # الاستدعاء الصحيح للنموذج
         response = client.models.generate_content(
             model="gemini-1.5-flash",
-            contents=[
-                prompt,
-                {"mime_type": "image/png", "data": img_bytes}
-            ]
+            contents=prompt,
         )
 
-        answer_text = response.text if response.text else "تم تحليله بنجاح."
-        highlight_str = ""
-        if "EXACT_TEXT:" in answer_text:
-            parts = answer_text.split("EXACT_TEXT:")
-            answer_text = parts[0].strip()
-            highlight_str = parts[1].strip()
-
-        img_b64 = render_page_with_highlight(doc, best_page_idx, highlight_str)
+        img_b64 = render_page_with_highlight(doc, best_page_idx)
 
         return {
             "page_number": best_page_idx + 1,
-            "answer": answer_text,
-            "highlight": highlight_str,
+            "answer": response.text,
+            "highlight": "",
             "page_image": img_b64
         }
     except Exception as e:
@@ -347,13 +299,6 @@ def index():
             border-radius: 20px;
             border: 2px solid #e2e8f0;
         }
-        .answer-highlight {
-            color: #dc2626;
-            font-weight: bold;
-            background: #fee2e2;
-            padding: 2px 6px;
-            border-radius: 4px;
-        }
         .page-preview {
             width: 100%;
             border-radius: 14px;
@@ -410,7 +355,7 @@ def index():
             </div>
             <div class="input-group">
                 <label id="label-custom-query">اكتب سؤالك بوضوح تام:</label>
-                <input type="text" id="custom-query-input" placeholder="مثال: ما هو تعريف الحركة الموجية؟" required>
+                <input type="text" id="custom-query-input" placeholder="مثال: ما هو قانون كبلر الاول؟" required>
             </div>
             <button type="submit" class="action-btn" id="custom-submit-btn">تحليل المستند واستخراج الإجابة 🔍</button>
         </form>
@@ -433,7 +378,7 @@ def index():
         <div class="grid-buttons" id="years-grid"></div>
     </div>
 
-    <!-- 3. شاشة الفصول الدراسية (فصلين دراسيين فقط) -->
+    <!-- 3. شاشة الفصول الدراسية -->
     <div id="terms-screen" class="hidden">
         <button class="back-btn" onclick="navigateTo('years-screen')" id="back-to-years">← اختيار سنة أخرى</button>
         <div class="section-title" id="terms-heading">اختر الفصل الدراسي:</div>
@@ -447,7 +392,7 @@ def index():
         <div class="grid-buttons" id="subjects-grid"></div>
     </div>
 
-    <!-- 5. شاشة لوحة تحكم المادة المختارة (الخيارات الأربعة) -->
+    <!-- 5. شاشة لوحة تحكم المادة المختارة -->
     <div id="subject-dashboard-screen" class="hidden">
         <button class="back-btn" onclick="navigateTo('subjects-screen')" id="back-to-subjects">← العودة لقائمة المواد</button>
         <div class="section-title" id="dashboard-heading">المادة: <span id="current-subject-name" style="color: var(--primary);"></span></div>
@@ -459,18 +404,18 @@ def index():
         </div>
     </div>
 
-    <!-- 6. واجهة البحث الذكي داخل كتاب المادة -->
+    <!-- 6. واجهة البحث الذكي -->
     <div id="ai-search-screen" class="hidden">
         <button class="back-btn" onclick="navigateTo('subject-dashboard-screen')" id="back-to-dashboard">← الرجوع لخيارات المادة</button>
         <div class="section-title" id="ai-search-heading">🤖 المساعد الذكي لكتاب: <span id="ai-book-title" style="color: var(--primary);"></span></div>
         <div class="input-group">
             <label id="label-query">اكتب سؤالك بوضوح تام:</label>
-            <input type="text" id="search-query" placeholder="مثال: ما هو قانون الجذب الكوني؟" required>
+            <input type="text" id="search-query" placeholder="مثال: ما هو قانون كبلر الاول؟" required>
         </div>
         <button class="action-btn" onclick="executeSearch()" id="search-btn">بحث ذكي وتحليل دقيق 🔍</button>
     </div>
 
-    <!-- عرض نتائج البحث والتثبت -->
+    <!-- عرض نتائج البحث -->
     <div id="result-container" class="result-box hidden">
         <h3 id="result-heading" style="color: var(--primary); margin-top:0;">🎯 النتيجة والتحليل الذكي:</h3>
         <p><strong id="label-page-num">رقم الصفحة:</strong> <span id="result-page"></span></p>
@@ -506,7 +451,7 @@ def index():
             btnIntermediate: "📚 المرحلة المتوسطة",
             btnSecondary: "🎓 المرحلة الثانوية (مسارات)",
             yearsHeading: "اختر السنة الدراسية:",
-            termsHeading: "اختر الفصل الدراسي (نظام الفصلين):",
+            termsHeading: "اختر الفصل الدراسي:",
             subjectsHeading: "المواد الدراسية المتاحة:",
             dashboardHeading: "المادة: ",
             aiSearchHeading: "🤖 المساعد الذكي لكتاب: ",
@@ -544,7 +489,7 @@ def index():
             btnIntermediate: "📚 Middle School",
             btnSecondary: "🎓 High School (Tracks)",
             yearsHeading: "Select Academic Year:",
-            termsHeading: "Select Term (2-Semester System):",
+            termsHeading: "Select Term:",
             subjectsHeading: "Available Subjects:",
             dashboardHeading: "Subject: ",
             aiSearchHeading: "🤖 AI Assistant for: ",
@@ -740,12 +685,7 @@ def index():
             if (resp.ok) {
                 document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
-                
-                let answerHtml = data.answer;
-                if (data.highlight) {
-                    answerHtml = answerHtml.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
-                }
-                document.getElementById('result-answer').innerHTML = answerHtml;
+                document.getElementById('result-answer').innerText = data.answer;
                 document.getElementById('result-image').src = data.page_image;
             } else {
                 document.getElementById('result-answer').innerText = data.error_ar || data.error;
@@ -790,12 +730,7 @@ def index():
             if (resp.ok) {
                 document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
-                
-                let answerHtml = data.answer;
-                if (data.highlight) {
-                    answerHtml = answerHtml.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
-                }
-                document.getElementById('result-answer').innerHTML = answerHtml;
+                document.getElementById('result-answer').innerText = data.answer;
                 document.getElementById('result-image').src = data.page_image;
             } else {
                 document.getElementById('result-answer').innerText = data.error || "تعذر تحليل الملف.";

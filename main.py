@@ -6,12 +6,10 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+from google import genai
 
-# تفعيل المفتاح الخاص بك
-GEMINI_API_KEY = "AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg"
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# تم وضع مفتاحك الخاص مباشرة هنا ليعمل التطبيق بدون أي أخطاء
+client = genai.Client(api_key="AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg")
 
 app = FastAPI(title="Smart Curriculum Educational Platform")
 
@@ -24,9 +22,6 @@ app.add_middleware(
 )
 
 BOOKS_DIR = os.path.join(os.path.dirname(__file__), "books")
-
-def get_gemini_model():
-    return genai.GenerativeModel('gemini-1.5-flash')
 
 def search_pdf_text(pdf_path: str, query: str):
     doc = fitz.open(pdf_path)
@@ -76,16 +71,18 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
         pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
-        model = get_gemini_model()
         prompt = (
             f"أنت معلم وخبير في المناهج الدراسية. بناءً على صفحة الكتاب المرفقة، أجب بدقة على السؤال التالي: '{query}'.\n"
             f"إذا وجدت الإجابة في الصفحة، حدد النص الدقيق المستخرج للإجابة في السطر الأخير مسبوقاً بـ 'EXACT_TEXT:'."
         )
 
-        response = model.generate_content([
-            prompt,
-            {"mime_type": "image/png", "data": img_bytes}
-        ])
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=[
+                prompt,
+                {"mime_type": "image/png", "data": img_bytes}
+            ]
+        )
 
         answer_text = response.text if response.text else "لم يتم العثور على إجابة واضحة."
         highlight_str = ""
@@ -130,16 +127,18 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
         pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
-        model = get_gemini_model()
         prompt = (
             f"بناءً على صفحة المستند المرفقة، أجب على السؤال التالي: '{query}'.\n"
             f"في نهاية إجابتك أضف سطر جديد مكتوب فيه EXACT_TEXT: متبوعاً بالجملة أو النص الدقيق المحدد للإجابة من الصفحة."
         )
 
-        response = model.generate_content([
-            prompt,
-            {"mime_type": "image/png", "data": img_bytes}
-        ])
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=[
+                prompt,
+                {"mime_type": "image/png", "data": img_bytes}
+            ]
+        )
 
         answer_text = response.text if response.text else "تم تحليله بنجاح."
         highlight_str = ""
@@ -411,7 +410,7 @@ def index():
             </div>
             <div class="input-group">
                 <label id="label-custom-query">اكتب سؤالك بوضوح تام:</label>
-                <input type="text" id="custom-query-input" placeholder="مثال: ما هو قانون كبلر الاول؟" required>
+                <input type="text" id="custom-query-input" placeholder="مثال: ما هو تعريف الحركة الموجية؟" required>
             </div>
             <button type="submit" class="action-btn" id="custom-submit-btn">تحليل المستند واستخراج الإجابة 🔍</button>
         </form>

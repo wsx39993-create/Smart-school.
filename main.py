@@ -6,7 +6,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 
-# التهيئة بالطريقة الصحيحة 100% للمكتبة الحديثة
+# التهيئة المباشرة والصحيحة للمكتبة الحديثة
 client = genai.Client(api_key="AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg")
 
 app = FastAPI(title="Smart Curriculum Educational Platform")
@@ -65,7 +65,6 @@ def search_in_book(book_code: str, query: str):
 
         prompt = f"بناءً على نص الصفحة التالي، أجب عن السؤال بدقة: {query}\n\nالنص:\n{text_content[:3000]}"
         
-        # الاستدعاء الصحيح للنموذج باللغة الحديثة
         response = client.models.generate_content(
             model="gemini-1.5-flash",
             contents=prompt,
@@ -93,7 +92,6 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
 
         prompt = f"بناءً على المستند المرفق، أجب عن السؤال بدقة: {query}\n\nالنص:\n{text_content[:3000]}"
         
-        # الاستدعاء الصحيح للنموذج
         response = client.models.generate_content(
             model="gemini-1.5-flash",
             contents=prompt,

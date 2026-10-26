@@ -1,4 +1,6 @@
 fastapi
 uvicorn
-PyMuPDF
 google-generativeai
+pydantic
+python-multipart
+PyMuPDF

@@ -94,6 +94,7 @@ def parse_reply(raw: str, page_indices):
     """يفصل إجابة الموديل عن أسطر البيانات الأربعة في آخرها."""
     first_marker = re.search(r"(?m)^\s*(PAGE|PRINTED_PAGE|BOXES|EXACT_TEXT)\s*:", raw)
     answer = raw[:first_marker.start()].strip() if first_marker else raw.strip()
+    answer = answer.replace("**", "").replace("__", "")
 
     page_idx = page_indices[0]
     m = re.search(r"(?m)^\s*PAGE\s*:\s*(\d+)", raw)
@@ -151,8 +152,34 @@ def call_gemini(pages, instructions: str) -> str:
         contents.append(label)
         contents.append(types.Part.from_bytes(data=png, mime_type="image/png"))
     contents.append(instructions)
-    resp = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=contents)
+    # التفكير المنخفض يخلي الرد أسرع بكثير (الافتراضي متوسط وأبطأ)
+    resp = gemini_client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(thinking_level="low")
+        ),
+    )
     return (resp.text or "").strip()
+
+
+def to_pixel_boxes(boxes, provider: str, w: int, h: int):
+    """يحوّل مستطيلات الموديل إلى بكسل على صورة الصفحة.
+    Gemini يستخدم صيغته الأصلية [ymin,xmin,ymax,xmax] بإحداثيات من 0 إلى 1000،
+    أما Claude فنطلب منه [x0,y0,x1,y1] بالبكسل مباشرة."""
+    out = []
+    pad = 3  # هامش بسيط عشان التظليل يغطي الحروف كاملة
+    for box in boxes:
+        try:
+            v = [float(n) for n in box]
+        except Exception:
+            continue
+        if provider == "gemini":
+            x0, y0, x1, y1 = v[1] / 1000 * w, v[0] / 1000 * h, v[3] / 1000 * w, v[2] / 1000 * h
+        else:
+            x0, y0, x1, y1 = v
+        out.append([x0 - pad, y0 - pad, x1 + pad, y1 + pad])
+    return out
 
 
 def ask_ai(query: str, doc: fitz.Document, page_indices):
@@ -160,30 +187,50 @@ def ask_ai(query: str, doc: fitz.Document, page_indices):
     if client is None and gemini_client is None:
         raise RuntimeError("لم يتم ضبط مفتاح: أضف ANTHROPIC_API_KEY أو GEMINI_API_KEY في إعدادات Render.")
 
+    provider = "claude" if client is not None else "gemini"
+
     pages = []
+    dims = {}
     for idx in page_indices:
         pix = doc[idx].get_pixmap(dpi=ANALYSIS_DPI)
+        dims[idx] = (pix.width, pix.height)
         label = f"صفحة رقم {idx + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):"
         pages.append((label, pix.tobytes("png")))
+
+    if provider == "gemini":
+        boxes_line = (
+            "BOXES: مصفوفة JSON من المستطيلات بصيغة [ymin,xmin,ymax,xmax] بإحداثيات مُطبَّعة من 0 إلى 1000 "
+            "على صورة تلك الصفحة (0,0 الزاوية العليا اليسرى، و1000 الحافة المقابلة). "
+            "مستطيل واحد لكل سطر من سطور الجملة التي فيها الإجابة، يحيط بالسطر نفسه فقط، "
+            "مثال: [[300,150,330,700],[335,500,360,700]]. إذا لم تجد الإجابة اكتب []\n"
+        )
+    else:
+        boxes_line = (
+            "BOXES: مصفوفة JSON من المستطيلات [x0,y0,x1,y1] بالبكسل على صورة تلك الصفحة "
+            "(الزاوية العليا اليسرى هي 0,0)، مستطيل واحد لكل سطر من سطور الجملة التي فيها الإجابة، "
+            "يحيط بالسطر نفسه فقط، مثال: [[80,300,500,324],[300,330,500,352]]. إذا لم تجد الإجابة اكتب []\n"
+        )
 
     instructions = (
         "أنت معلم وخبير في المناهج الدراسية. اعتماداً على صفحات الكتاب المرفقة فقط، "
         f"أجب بوضوح ودقة وباللغة العربية على السؤال التالي: '{query}'.\n"
+        "اكتب الإجابة نصاً عادياً بدون أي تنسيق Markdown (بدون نجوم أو عناوين).\n"
         "إذا لم تجد الإجابة في الصفحات المرفقة فقل ذلك بصراحة ولا تخترع إجابة.\n"
         "بعد الإجابة أضف أربعة أسطر بهذا الشكل بالضبط، كل واحد في سطر مستقل:\n"
         "PAGE: رقم الصفحة المرفقة التي وجدت فيها الإجابة، كما كُتب في عنوان الصورة (أو 0 إذا لم تجدها)\n"
         "PRINTED_PAGE: الرقم المطبوع على الصفحة نفسها داخل الكتاب (يكون غالباً في أسفل الصفحة)، أو 0 إذا لا يوجد رقم مطبوع\n"
-        "BOXES: مصفوفة JSON من المستطيلات [x0,y0,x1,y1] بالبكسل على صورة تلك الصفحة "
-        "(الزاوية العليا اليسرى هي 0,0)، مستطيل واحد لكل سطر من سطور الجملة التي فيها الإجابة، "
-        "تحيط بالجملة فقط، مثال: [[80,300,500,324],[300,330,500,352]]. إذا لم تجد الإجابة اكتب []\n"
+        + boxes_line +
         "EXACT_TEXT: الجملة الدقيقة من الكتاب التي تحتوي الإجابة، منسوخة كما هي"
     )
 
-    if client is not None:
+    if provider == "claude":
         raw = call_claude(pages, instructions)
     else:
         raw = call_gemini(pages, instructions)
-    return parse_reply(raw, page_indices)
+
+    answer, page_idx, printed, boxes, highlight = parse_reply(raw, page_indices)
+    w, h = dims[page_idx]
+    return answer, page_idx, printed, to_pixel_boxes(boxes, provider, w, h), highlight
 
 
 def build_result(doc: fitz.Document, query: str, empty_msg: str):

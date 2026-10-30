@@ -4,16 +4,24 @@ import json
 import base64
 import fitz  # PyMuPDF
 import anthropic
+from google import genai
+from google.genai import types
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# المفتاح يُقرأ من متغيرات البيئة (Render -> Environment -> ANTHROPIC_API_KEY)
+# المفاتيح تُقرأ من متغيرات البيئة (Render -> Environment)
+# - إذا أضفت ANTHROPIC_API_KEY يستخدم الموقع Claude (مدفوع حسب الاستخدام)
+# - وإذا أضفت GEMINI_API_KEY فقط يستخدم Gemini (فيه باقة مجانية)
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # موديل Claude (للتوفير في التكلفة يمكنك استخدام claude-haiku-5-5)
 MODEL_NAME = "claude-sonnet-5-5"
+# موديل Gemini (اقترحته جوجل نفسها في رسالة الخطأ)
+GEMINI_MODEL_NAME = "gemini-3.8-flash"
 
 # دقة تحويل الصفحة إلى صورة قبل إرسالها للموديل (الإحداثيات اللي يرجعها الموديل تعتمد عليها)
 ANALYSIS_DPI = 110
@@ -116,17 +124,10 @@ def parse_reply(raw: str, page_indices):
     return answer, page_idx, printed, boxes, highlight
 
 
-def ask_ai(query: str, doc: fitz.Document, page_indices):
-    """يرسل صور الصفحات المرشحة إلى Claude ويرجع نتيجة جاهزة للعرض."""
-    if client is None:
-        raise RuntimeError("لم يتم ضبط ANTHROPIC_API_KEY في إعدادات Render.")
-
+def call_claude(pages, instructions: str) -> str:
     content = []
-    for idx in page_indices:
-        pix = doc[idx].get_pixmap(dpi=ANALYSIS_DPI)
-        png = pix.tobytes("png")
-        content.append({"type": "text",
-                        "text": f"صفحة رقم {idx + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):"})
+    for label, png in pages:
+        content.append({"type": "text", "text": label})
         content.append({
             "type": "image",
             "source": {
@@ -135,8 +136,37 @@ def ask_ai(query: str, doc: fitz.Document, page_indices):
                 "data": base64.b64encode(png).decode("utf-8"),
             },
         })
+    content.append({"type": "text", "text": instructions})
+    resp = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": content}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
 
-    content.append({"type": "text", "text": (
+
+def call_gemini(pages, instructions: str) -> str:
+    contents = []
+    for label, png in pages:
+        contents.append(label)
+        contents.append(types.Part.from_bytes(data=png, mime_type="image/png"))
+    contents.append(instructions)
+    resp = gemini_client.models.generate_content(model=GEMINI_MODEL_NAME, contents=contents)
+    return (resp.text or "").strip()
+
+
+def ask_ai(query: str, doc: fitz.Document, page_indices):
+    """يرسل صور الصفحات المرشحة للذكاء الاصطناعي ويرجع نتيجة جاهزة للعرض."""
+    if client is None and gemini_client is None:
+        raise RuntimeError("لم يتم ضبط مفتاح: أضف ANTHROPIC_API_KEY أو GEMINI_API_KEY في إعدادات Render.")
+
+    pages = []
+    for idx in page_indices:
+        pix = doc[idx].get_pixmap(dpi=ANALYSIS_DPI)
+        label = f"صفحة رقم {idx + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):"
+        pages.append((label, pix.tobytes("png")))
+
+    instructions = (
         "أنت معلم وخبير في المناهج الدراسية. اعتماداً على صفحات الكتاب المرفقة فقط، "
         f"أجب بوضوح ودقة وباللغة العربية على السؤال التالي: '{query}'.\n"
         "إذا لم تجد الإجابة في الصفحات المرفقة فقل ذلك بصراحة ولا تخترع إجابة.\n"
@@ -147,14 +177,12 @@ def ask_ai(query: str, doc: fitz.Document, page_indices):
         "(الزاوية العليا اليسرى هي 0,0)، مستطيل واحد لكل سطر من سطور الجملة التي فيها الإجابة، "
         "تحيط بالجملة فقط، مثال: [[80,300,500,324],[300,330,500,352]]. إذا لم تجد الإجابة اكتب []\n"
         "EXACT_TEXT: الجملة الدقيقة من الكتاب التي تحتوي الإجابة، منسوخة كما هي"
-    )})
-
-    resp = client.messages.create(
-        model=MODEL_NAME,
-        max_tokens=1500,
-        messages=[{"role": "user", "content": content}],
     )
-    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+
+    if client is not None:
+        raw = call_claude(pages, instructions)
+    else:
+        raw = call_gemini(pages, instructions)
     return parse_reply(raw, page_indices)
 
 
@@ -767,6 +795,16 @@ def index():
         }
     }
 
+    async function readJson(resp) {
+        const text = await resp.text();
+        try {
+            return JSON.parse(text);
+        } catch (err) {
+            const msg = `خطأ من السيرفر (${resp.status}): ${text.slice(0, 200)}`;
+            return { error: msg, error_ar: msg };
+        }
+    }
+
     async function executeSearch() {
         const q = document.getElementById('search-query').value;
         if (!q) return alert(currentLang === 'ar' ? "يرجى كتابة السؤال أولاً" : "Please enter a question");
@@ -784,7 +822,7 @@ def index():
 
         try {
             const resp = await fetch(`/api/search?book_code=${selectedBookCode}&query=${encodeURIComponent(q)}`);
-            const data = await resp.json();
+            const data = await readJson(resp);
             if (resp.ok) {
                 document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
@@ -799,7 +837,7 @@ def index():
                 document.getElementById('result-answer').innerText = data.error_ar || data.error;
             }
         } catch(e) {
-            document.getElementById('result-answer').innerText = "حدث خطأ أثناء الاتصال بالسيرفر.";
+            document.getElementById('result-answer').innerText = "حدث خطأ أثناء الاتصال بالسيرفر: " + e.message;
         }
     }
 
@@ -834,7 +872,7 @@ def index():
                 method: 'POST',
                 body: formData
             });
-            const data = await resp.json();
+            const data = await readJson(resp);
             if (resp.ok) {
                 document.getElementById('image-container').classList.remove('hidden');
                 document.getElementById('result-page').innerText = data.page_number;
@@ -846,7 +884,7 @@ def index():
                 document.getElementById('result-answer').innerText = data.error || "تعذر تحليل الملف.";
             }
         } catch(e) {
-            document.getElementById('result-answer').innerText = "حدث خطأ في عملية رفع أو تحليل الملف.";
+            document.getElementById('result-answer').innerText = "حدث خطأ في عملية رفع أو تحليل الملف: " + e.message;
         }
     }
 </script>

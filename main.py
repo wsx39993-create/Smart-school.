@@ -127,37 +127,27 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
                 best_page_idx = page_idx
 
         page = doc[best_page_idx]
-        pix = page.get_pixmap(dpi=120)
-        img_bytes = pix.tobytes("png")
+        text_content = page.get_text("text")
 
         model = get_gemini_model()
         prompt = (
-            f"بناءً على صفحة المستند المرفقة، أجب على السؤال التالي: '{query}'.\n"
-            f"في نهاية إجابتك أضف سطر جديد مكتوب فيه EXACT_TEXT: متبوعاً بالجملة أو النص الدقيق المحدد للإجابة من الصفحة."
+            f"بناءً على نص الصفحة التالية من المستند، أجب بوضوح ودقة على السؤال التالي: '{query}'.\n\n"
+            f"نص الصفحة:\n{text_content[:3000]}"
         )
 
-        response = model.generate_content([
-            prompt,
-            {"mime_type": "image/png", "data": img_bytes}
-        ])
+        response = model.generate_content(prompt)
+        answer_text = response.text if response and response.text else "لم يتم العثور على إجابة كافية في هذه الصفحة."
 
-        answer_text = response.text if response.text else "تم تحليله بنجاح."
-        highlight_str = ""
-        if "EXACT_TEXT:" in answer_text:
-            parts = answer_text.split("EXACT_TEXT:")
-            answer_text = parts[0].strip()
-            highlight_str = parts[1].strip()
-
-        img_b64 = render_page_with_highlight(doc, best_page_idx, highlight_str)
+        img_b64 = render_page_with_highlight(doc, best_page_idx, "")
 
         return {
             "page_number": best_page_idx + 1,
             "answer": answer_text,
-            "highlight": highlight_str,
+            "highlight": "",
             "page_image": img_b64
         }
     except Exception as e:
-        return JSONResponse(status_code=500, content=str(e))
+        return JSONResponse(status_code=500, content={"error": f"خطأ في المعالجة: {str(e)}"})
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -411,7 +401,7 @@ def index():
             </div>
             <div class="input-group">
                 <label id="label-custom-query">اكتب سؤالك بوضوح تام:</label>
-                <input type="text" id="custom-query-input" placeholder="مثال: ما هو تعريف الحركة الموجية؟" required>
+                <input type="text" id="custom-query-input" placeholder="مثال: ما هو قانون كبلر الاول؟" required>
             </div>
             <button type="submit" class="action-btn" id="custom-submit-btn">تحليل المستند واستخراج الإجابة 🔍</button>
         </form>
@@ -466,7 +456,7 @@ def index():
         <div class="section-title" id="ai-search-heading">🤖 المساعد الذكي لكتاب: <span id="ai-book-title" style="color: var(--primary);"></span></div>
         <div class="input-group">
             <label id="label-query">اكتب سؤالك بوضوح تام:</label>
-            <input type="text" id="search-query" placeholder="مثال: ما هو قانون الجذب الكوني؟" required>
+            <input type="text" id="search-query" placeholder="مثال: ما هو قانون كبلر الاول؟" required>
         </div>
         <button class="action-btn" onclick="executeSearch()" id="search-btn">بحث ذكي وتحليل دقيق 🔍</button>
     </div>
@@ -793,9 +783,6 @@ def index():
                 document.getElementById('result-page').innerText = data.page_number;
                 
                 let answerHtml = data.answer;
-                if (data.highlight) {
-                    answerHtml = answerHtml.replace(data.highlight, `<span class="answer-highlight">${data.highlight}</span>`);
-                }
                 document.getElementById('result-answer').innerHTML = answerHtml;
                 document.getElementById('result-image').src = data.page_image;
             } else {

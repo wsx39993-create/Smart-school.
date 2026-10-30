@@ -1,20 +1,22 @@
 import os
-import io
-import fitz  # PyMuPDF
+import re
+import json
 import base64
-from typing import Optional
+import fitz  # PyMuPDF
+import anthropic
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types
 
-# المفتاح يُقرأ من متغيرات البيئة (Render -> Environment -> GEMINI_API_KEY)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+# المفتاح يُقرأ من متغيرات البيئة (Render -> Environment -> ANTHROPIC_API_KEY)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
-# اسم الموديل (الخطأ نفسه من جوجل اقترح هذا الاسم)
-MODEL_NAME = "gemini-3.8-flash"
+# موديل Claude (للتوفير في التكلفة يمكنك استخدام claude-haiku-5-5)
+MODEL_NAME = "claude-sonnet-5-5"
+
+# دقة تحويل الصفحة إلى صورة قبل إرسالها للموديل (الإحداثيات اللي يرجعها الموديل تعتمد عليها)
+ANALYSIS_DPI = 110
 
 app = FastAPI(title="Smart Curriculum Educational Platform")
 
@@ -28,37 +30,154 @@ app.add_middleware(
 
 BOOKS_DIR = os.path.join(os.path.dirname(__file__), "books")
 
-def search_pdf_text(pdf_path: str, query: str):
-    doc = fitz.open(pdf_path)
-    keywords = [k.strip() for k in query.split() if len(k.strip()) > 2]
-    matched_pages = []
 
-    for page_idx in range(len(doc)):
-        page = doc[page_idx]
-        text = page.get_text("text")
-        score = sum(1 for kw in keywords if kw.lower() in text.lower())
+def rank_pages(doc: fitz.Document, query: str, top_n: int = 3, scan_limit: int = 400):
+    """يرتّب صفحات الكتاب حسب تطابق كلمات السؤال ويرجع أفضل الصفحات."""
+    keywords = [k.strip().lower() for k in query.split() if len(k.strip()) > 2]
+    scored = []
+    for idx in range(min(len(doc), scan_limit)):
+        text = doc[idx].get_text("text").lower()
+        score = sum(1 for kw in keywords if kw in text)
         if score > 0:
-            matched_pages.append((page_idx, score))
+            scored.append((idx, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    if scored:
+        return [i for i, _ in scored[:top_n]]
+    # إذا لم نجد تطابقاً نصياً (مثلاً كتاب ممسوح ضوئياً) نرسل أول الصفحات
+    return list(range(min(len(doc), top_n)))
 
-    matched_pages.sort(key=lambda x: x[1], reverse=True)
-    return [p[0] for p in matched_pages[:3]] if matched_pages else [0]
 
-def render_page_with_highlight(doc: fitz.Document, page_num: int, highlight_text: str = "") -> str:
+def render_page_with_highlight(doc: fitz.Document, page_num: int,
+                               highlight_text: str = "", boxes_px=None) -> str:
+    """يرسم الصفحة كاملة ويظلل الإجابة بالأحمر.
+    1) إذا الملف فيه نص قابل للبحث نظلل النص نفسه.
+    2) وإلا (ملف صور) نستخدم المستطيلات اللي حددها الموديل على الصورة."""
     page = doc[page_num]
+    rects = []
+
     if highlight_text:
-        text_instances = page.search_for(highlight_text)
-        for inst in text_instances:
-            page.draw_rect(inst, color=(1, 0, 0), fill=(1, 0.8, 0.8), overlay=True)
+        try:
+            rects = list(page.search_for(highlight_text))
+        except Exception:
+            rects = []
+
+    if not rects and boxes_px:
+        k = 72.0 / ANALYSIS_DPI  # من بكسل الصورة إلى نقاط الـ PDF
+        for b in boxes_px:
+            try:
+                x0, y0, x1, y1 = [float(v) for v in b]
+            except Exception:
+                continue
+            r = fitz.Rect(min(x0, x1) * k, min(y0, y1) * k, max(x0, x1) * k, max(y0, y1) * k)
+            r = r & page.rect
+            if not r.is_empty:
+                rects.append(r)
+
+    for r in rects:
+        page.draw_rect(r, color=(1, 0, 0), fill=(1, 0, 0), fill_opacity=0.22,
+                       width=1.5, overlay=True)
 
     pix = page.get_pixmap(dpi=120)
-    img_bytes = pix.tobytes("png")
-    encoded = base64.b64encode(img_bytes).decode('utf-8')
+    encoded = base64.b64encode(pix.tobytes("png")).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
+
+
+def parse_reply(raw: str, page_indices):
+    """يفصل إجابة الموديل عن أسطر البيانات الأربعة في آخرها."""
+    first_marker = re.search(r"(?m)^\s*(PAGE|PRINTED_PAGE|BOXES|EXACT_TEXT)\s*:", raw)
+    answer = raw[:first_marker.start()].strip() if first_marker else raw.strip()
+
+    page_idx = page_indices[0]
+    m = re.search(r"(?m)^\s*PAGE\s*:\s*(\d+)", raw)
+    if m:
+        n = int(m.group(1)) - 1
+        if n in page_indices:
+            page_idx = n
+
+    printed = None
+    m = re.search(r"(?m)^\s*PRINTED_PAGE\s*:\s*(\d+)", raw)
+    if m and int(m.group(1)) > 0:
+        printed = int(m.group(1))
+
+    boxes = []
+    m = re.search(r"(?m)^\s*BOXES\s*:\s*(\[.*\])\s*$", raw)
+    if m:
+        try:
+            data = json.loads(m.group(1))
+            boxes = [b for b in data if isinstance(b, list) and len(b) == 4]
+        except Exception:
+            boxes = []
+
+    highlight = ""
+    m = re.search(r"(?m)^\s*EXACT_TEXT\s*:\s*(.+)$", raw)
+    if m:
+        highlight = m.group(1).strip(" \"'«»")
+
+    return answer, page_idx, printed, boxes, highlight
+
+
+def ask_ai(query: str, doc: fitz.Document, page_indices):
+    """يرسل صور الصفحات المرشحة إلى Claude ويرجع نتيجة جاهزة للعرض."""
+    if client is None:
+        raise RuntimeError("لم يتم ضبط ANTHROPIC_API_KEY في إعدادات Render.")
+
+    content = []
+    for idx in page_indices:
+        pix = doc[idx].get_pixmap(dpi=ANALYSIS_DPI)
+        png = pix.tobytes("png")
+        content.append({"type": "text",
+                        "text": f"صفحة رقم {idx + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):"})
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": base64.b64encode(png).decode("utf-8"),
+            },
+        })
+
+    content.append({"type": "text", "text": (
+        "أنت معلم وخبير في المناهج الدراسية. اعتماداً على صفحات الكتاب المرفقة فقط، "
+        f"أجب بوضوح ودقة وباللغة العربية على السؤال التالي: '{query}'.\n"
+        "إذا لم تجد الإجابة في الصفحات المرفقة فقل ذلك بصراحة ولا تخترع إجابة.\n"
+        "بعد الإجابة أضف أربعة أسطر بهذا الشكل بالضبط، كل واحد في سطر مستقل:\n"
+        "PAGE: رقم الصفحة المرفقة التي وجدت فيها الإجابة، كما كُتب في عنوان الصورة (أو 0 إذا لم تجدها)\n"
+        "PRINTED_PAGE: الرقم المطبوع على الصفحة نفسها داخل الكتاب (يكون غالباً في أسفل الصفحة)، أو 0 إذا لا يوجد رقم مطبوع\n"
+        "BOXES: مصفوفة JSON من المستطيلات [x0,y0,x1,y1] بالبكسل على صورة تلك الصفحة "
+        "(الزاوية العليا اليسرى هي 0,0)، مستطيل واحد لكل سطر من سطور الجملة التي فيها الإجابة، "
+        "تحيط بالجملة فقط، مثال: [[80,300,500,324],[300,330,500,352]]. إذا لم تجد الإجابة اكتب []\n"
+        "EXACT_TEXT: الجملة الدقيقة من الكتاب التي تحتوي الإجابة، منسوخة كما هي"
+    )})
+
+    resp = client.messages.create(
+        model=MODEL_NAME,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": content}],
+    )
+    raw = "".join(b.text for b in resp.content if b.type == "text").strip()
+    return parse_reply(raw, page_indices)
+
+
+def build_result(doc: fitz.Document, query: str, empty_msg: str):
+    candidates = rank_pages(doc, query)
+    answer, page_idx, printed, boxes, highlight = ask_ai(query, doc, candidates)
+    if not answer:
+        answer = empty_msg
+
+    img_b64 = render_page_with_highlight(doc, page_idx, highlight, boxes)
+    return {
+        # رقم الصفحة المطبوع داخل الكتاب، وإذا ما انقرأ نرجع ترتيبها في الملف
+        "page_number": printed if printed else page_idx + 1,
+        "pdf_page": page_idx + 1,
+        "answer": answer,
+        "highlight": highlight,
+        "page_image": img_b64
+    }
+
 
 @app.get("/api/search")
 def search_in_book(book_code: str = Query(...), query: str = Query(...)):
-    filename = f"{book_code}.pdf"
-    pdf_path = os.path.join(BOOKS_DIR, filename)
+    pdf_path = os.path.join(BOOKS_DIR, f"{book_code}.pdf")
 
     if not os.path.exists(pdf_path):
         return JSONResponse(
@@ -69,86 +188,23 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
 
     try:
         doc = fitz.open(pdf_path)
-        top_pages = search_pdf_text(pdf_path, query)
-        best_page_idx = top_pages[0]
-        page = doc[best_page_idx]
-
-        pix = page.get_pixmap(dpi=120)
-        img_bytes = pix.tobytes("png")
-
-        prompt = (
-            f"أنت معلم وخبير في المناهج الدراسية. بناءً على صفحة الكتاب المرفقة، أجب بدقة على السؤال التالي: '{query}'.\n"
-            f"إذا وجدت الإجابة في الصفحة، حدد النص الدقيق المستخرج للإجابة في السطر الأخير مسبوقاً بـ 'EXACT_TEXT:'."
-        )
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
-            ],
-        )
-
-        answer_text = response.text if response.text else "لم يتم العثور على إجابة واضحة."
-        highlight_str = ""
-        if "EXACT_TEXT:" in answer_text:
-            parts = answer_text.split("EXACT_TEXT:")
-            answer_text = parts[0].strip()
-            highlight_str = parts[1].strip()
-
-        img_b64 = render_page_with_highlight(doc, best_page_idx, highlight_str)
-
-        return {
-            "page_number": best_page_idx + 1,
-            "answer": answer_text,
-            "highlight": highlight_str,
-            "page_image": img_b64
-        }
+        return build_result(doc, query, "لم يتم العثور على إجابة واضحة.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.post("/api/custom-pdf-search")
 async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)):
-    if not file.filename.endswith('.pdf'):
+    if not file.filename.lower().endswith('.pdf'):
         return JSONResponse(status_code=400, content={"error": "يجب أن يكون الملف بصيغة PDF فقط."})
-    
+
     try:
         contents = await file.read()
         doc = fitz.open(stream=contents, filetype="pdf")
-        
-        keywords = [k.strip() for k in query.split() if len(k.strip()) > 2]
-        best_page_idx = 0
-        max_score = -1
-
-        search_limit = min(len(doc), 60)
-        for page_idx in range(search_limit):
-            text = doc[page_idx].get_text("text")
-            score = sum(1 for kw in keywords if kw.lower() in text.lower())
-            if score > max_score:
-                max_score = score
-                best_page_idx = page_idx
-
-        page = doc[best_page_idx]
-        text_content = page.get_text("text")
-
-        prompt = (
-            f"بناءً على نص الصفحة التالية من المستند، أجب بوضوح ودقة على السؤال التالي: '{query}'.\n\n"
-            f"نص الصفحة:\n{text_content[:3000]}"
-        )
-
-        response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-        answer_text = response.text if response and response.text else "لم يتم العثور على إجابة كافية في هذه الصفحة."
-
-        img_b64 = render_page_with_highlight(doc, best_page_idx, "")
-
-        return {
-            "page_number": best_page_idx + 1,
-            "answer": answer_text,
-            "highlight": "",
-            "page_image": img_b64
-        }
+        return build_result(doc, query, "لم يتم العثور على إجابة كافية في هذا المستند.")
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"خطأ في المعالجة: {str(e)}"})
+
 
 @app.get("/", response_class=HTMLResponse)
 def index():

@@ -8,8 +8,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
 
-# تفعيل المفتاح الخاص بك
-GEMINI_API_KEY = "AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg"
+# المفتاح يُقرأ من متغيرات البيئة (Render -> Environment -> GEMINI_API_KEY)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
@@ -26,7 +26,7 @@ app.add_middleware(
 BOOKS_DIR = os.path.join(os.path.dirname(__file__), "books")
 
 def get_gemini_model():
-    return genai.GenerativeModel('gemini-1.5-flash')
+    return genai.GenerativeModel('gemini-2.5-flash')
 
 def search_pdf_text(pdf_path: str, query: str):
     doc = fitz.open(pdf_path)

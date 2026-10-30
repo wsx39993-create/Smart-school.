@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-google-genai
-pydantic
+anthropic
 python-multipart
 PyMuPDF
+pydantic

@@ -6,10 +6,12 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
+import google.generativeai as genai
 
-# تم وضع مفتاحك الخاص مباشرة هنا ليعمل التطبيق بدون أي أخطاء
-client = genai.Client(api_key="AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg")
+# تفعيل المفتاح الخاص بك
+GEMINI_API_KEY = "AQ.Ab8RN6JQ33Xzudn1Fk7kidZSLi9NZu8cWoxMnTqNLo5kY8S3mg"
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 app = FastAPI(title="Smart Curriculum Educational Platform")
 
@@ -22,6 +24,9 @@ app.add_middleware(
 )
 
 BOOKS_DIR = os.path.join(os.path.dirname(__file__), "books")
+
+def get_gemini_model():
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 def search_pdf_text(pdf_path: str, query: str):
     doc = fitz.open(pdf_path)
@@ -71,18 +76,16 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
         pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
+        model = get_gemini_model()
         prompt = (
             f"أنت معلم وخبير في المناهج الدراسية. بناءً على صفحة الكتاب المرفقة، أجب بدقة على السؤال التالي: '{query}'.\n"
             f"إذا وجدت الإجابة في الصفحة، حدد النص الدقيق المستخرج للإجابة في السطر الأخير مسبوقاً بـ 'EXACT_TEXT:'."
         )
 
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                prompt,
-                {"mime_type": "image/png", "data": img_bytes}
-            ]
-        )
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "image/png", "data": img_bytes}
+        ])
 
         answer_text = response.text if response.text else "لم يتم العثور على إجابة واضحة."
         highlight_str = ""
@@ -127,18 +130,16 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
         pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
+        model = get_gemini_model()
         prompt = (
             f"بناءً على صفحة المستند المرفقة، أجب على السؤال التالي: '{query}'.\n"
             f"في نهاية إجابتك أضف سطر جديد مكتوب فيه EXACT_TEXT: متبوعاً بالجملة أو النص الدقيق المحدد للإجابة من الصفحة."
         )
 
-        response = client.models.generate_content(
-            model="gemini-1.5-flash",
-            contents=[
-                prompt,
-                {"mime_type": "image/png", "data": img_bytes}
-            ]
-        )
+        response = model.generate_content([
+            prompt,
+            {"mime_type": "image/png", "data": img_bytes}
+        ])
 
         answer_text = response.text if response.text else "تم تحليله بنجاح."
         highlight_str = ""
@@ -156,7 +157,7 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
             "page_image": img_b64
         }
     except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        return JSONResponse(status_code=500, content=str(e))
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -433,7 +434,7 @@ def index():
         <div class="grid-buttons" id="years-grid"></div>
     </div>
 
-    <!-- 3. شاشة الفصول الدراسية (فصلين دراسيين فقط) -->
+    <!-- 3. شاشة الفصول الدراسية -->
     <div id="terms-screen" class="hidden">
         <button class="back-btn" onclick="navigateTo('years-screen')" id="back-to-years">← اختيار سنة أخرى</button>
         <div class="section-title" id="terms-heading">اختر الفصل الدراسي:</div>
@@ -447,7 +448,7 @@ def index():
         <div class="grid-buttons" id="subjects-grid"></div>
     </div>
 
-    <!-- 5. شاشة لوحة تحكم المادة المختارة (الخيارات الأربعة) -->
+    <!-- 5. شاشة لوحة تحكم المادة المختارة -->
     <div id="subject-dashboard-screen" class="hidden">
         <button class="back-btn" onclick="navigateTo('subjects-screen')" id="back-to-subjects">← العودة لقائمة المواد</button>
         <div class="section-title" id="dashboard-heading">المادة: <span id="current-subject-name" style="color: var(--primary);"></span></div>
@@ -459,7 +460,7 @@ def index():
         </div>
     </div>
 
-    <!-- 6. واجهة البحث الذكي داخل كتاب المادة -->
+    <!-- 6. واجهة البحث الذكي -->
     <div id="ai-search-screen" class="hidden">
         <button class="back-btn" onclick="navigateTo('subject-dashboard-screen')" id="back-to-dashboard">← الرجوع لخيارات المادة</button>
         <div class="section-title" id="ai-search-heading">🤖 المساعد الذكي لكتاب: <span id="ai-book-title" style="color: var(--primary);"></span></div>
@@ -470,7 +471,7 @@ def index():
         <button class="action-btn" onclick="executeSearch()" id="search-btn">بحث ذكي وتحليل دقيق 🔍</button>
     </div>
 
-    <!-- عرض نتائج البحث والتثبت -->
+    <!-- عرض نتائج البحث -->
     <div id="result-container" class="result-box hidden">
         <h3 id="result-heading" style="color: var(--primary); margin-top:0;">🎯 النتيجة والتحليل الذكي:</h3>
         <p><strong id="label-page-num">رقم الصفحة:</strong> <span id="result-page"></span></p>
@@ -506,7 +507,7 @@ def index():
             btnIntermediate: "📚 المرحلة المتوسطة",
             btnSecondary: "🎓 المرحلة الثانوية (مسارات)",
             yearsHeading: "اختر السنة الدراسية:",
-            termsHeading: "اختر الفصل الدراسي (نظام الفصلين):",
+            termsHeading: "اختر الفصل الدراسي:",
             subjectsHeading: "المواد الدراسية المتاحة:",
             dashboardHeading: "المادة: ",
             aiSearchHeading: "🤖 المساعد الذكي لكتاب: ",
@@ -544,7 +545,7 @@ def index():
             btnIntermediate: "📚 Middle School",
             btnSecondary: "🎓 High School (Tracks)",
             yearsHeading: "Select Academic Year:",
-            termsHeading: "Select Term (2-Semester System):",
+            termsHeading: "Select Term:",
             subjectsHeading: "Available Subjects:",
             dashboardHeading: "Subject: ",
             aiSearchHeading: "🤖 AI Assistant for: ",
@@ -809,3 +810,7 @@ def index():
 </html>
     """
     return HTMLResponse(content=html_content)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=10000)

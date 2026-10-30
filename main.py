@@ -27,12 +27,13 @@ from fastapi.middleware.cors import CORSMiddleware
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-client = (anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=30.0, max_retries=0)
+client = (anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=0)
           if ANTHROPIC_API_KEY else None)
-gemini_client = (genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=30000))
+gemini_client = (genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=60000))
                  if GEMINI_API_KEY else None)
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
+CLAUDE_FALLBACK = os.environ.get("CLAUDE_FALLBACK", "claude-sonnet-5-5")
 GEMINI_MODELS = [m.strip() for m in
                  os.environ.get("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
 
@@ -50,8 +51,8 @@ MAX_UPLOAD = 500 * 1024 * 1024   # 500 ميجابايت
 ANALYSIS_DPI = 100
 OCR_DPI = 110
 DISPLAY_DPI = 110
-HEDGE_SECONDS = float(os.environ.get("HEDGE_SECONDS", "2.5"))              # إذا تأخر الموديل الأول أكثر من هذا يبدأ الثاني بالتوازي (أسرع نتيجة تفوز)
-TEXT_PAGES = 2                   # عدد الصفحات المرسلة للموديل في الكتب النصية
+HEDGE_SECONDS = float(os.environ.get("HEDGE_SECONDS", "1.5"))              # إذا تأخر الموديل الأول أكثر من هذا يبدأ الثاني بالتوازي (أسرع نتيجة تفوز)
+TEXT_PAGES = 3                   # عدد الصفحات المرسلة للموديل في الكتب النصية
 IEN_URL = "https://ien.edu.sa"
 EIN_CHANNEL = "https://www.youtube.com/@dorosien"
 
@@ -536,7 +537,7 @@ def _is_transient(e) -> bool:
     return any(k in text for k in ("timeout", "timed out", "unavailable", "overloaded", "connection", "deadline"))
 
 
-def call_claude(pages, instructions, max_tokens):
+def call_claude(pages, instructions, max_tokens, model=None):
     content = []
     for p in pages:
         if p.get("text") is not None:
@@ -546,7 +547,7 @@ def call_claude(pages, instructions, max_tokens):
             content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
                                                          "data": base64.b64encode(p["jpeg"]).decode()}})
     content.append({"type": "text", "text": instructions})
-    resp = client.messages.create(model=CLAUDE_MODEL, max_tokens=max_tokens, temperature=0.2,
+    resp = client.messages.create(model=model or CLAUDE_MODEL, max_tokens=max_tokens,
                                   messages=[{"role": "user", "content": content}])
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
@@ -566,6 +567,14 @@ def call_gemini(model, pages, instructions, max_tokens):
     return (resp.text or "").strip()
 
 
+LAST_AI_ERRORS = []
+
+
+def _note_ai_error(provider, model, e):
+    LAST_AI_ERRORS.append(f"{provider}/{model}: {type(e).__name__}: {str(e)[:160]}")
+    del LAST_AI_ERRORS[:-10]
+
+
 def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDGE_SECONDS):
     """يشغّل الموديل الأول؛ إذا تأخر أكثر من `hedge` ثانية يطلق الموديل التالي بالتوازي
     ويأخذ أول رد صالح. هذا يلغي انتظار المهلة الطويلة عند بطء مزوّد واحد."""
@@ -574,6 +583,8 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
         attempts.append(("claude", CLAUDE_MODEL))
     if gemini_client:
         attempts += [("gemini", m) for m in GEMINI_MODELS]
+    if client and CLAUDE_FALLBACK and CLAUDE_FALLBACK != CLAUDE_MODEL:
+        attempts.append(("claude", CLAUDE_FALLBACK))
     if prefer == "gemini":
         attempts.sort(key=lambda a: 0 if a[0] == "gemini" else 1)
     if not attempts:
@@ -584,11 +595,12 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
         instructions = make_instructions(provider)
         for i in range(2):
             try:
-                raw = (call_claude(pages, instructions, max_tokens) if provider == "claude"
+                raw = (call_claude(pages, instructions, max_tokens, model) if provider == "claude"
                        else call_gemini(model, pages, instructions, max_tokens))
                 return (raw, provider) if raw else None
             except Exception as e:
                 print(f"[AI] {provider}/{model} attempt {i + 1}: {type(e).__name__}: {str(e)[:200]}")
+                _note_ai_error(provider, model, e)
                 if i == 0 and _is_transient(e):
                     time.sleep(0.8)
                     continue
@@ -700,33 +712,100 @@ def render_page(doc, page_num, rects):
 NO_MATCH = "لم أجد في الكتاب كلمات قريبة من سؤالك. جرّب صياغة أخرى بكلمات تظهر في الدرس نفسه."
 
 
+def _line_groups(page):
+    lines = OrderedDict()
+    for w in page_words(page):
+        lines.setdefault((w[5], w[6]), []).append(w)
+    return list(lines.values())
+
+
+def local_snippet(page, toks, span=2):
+    """أفضل سطرين متتاليين فيهما كلمات السؤال: يرجع (النص، مستطيلات التظليل)."""
+    groups = _line_groups(page)
+    if not groups or not toks:
+        return "", []
+    texts = [norm(" ".join(w[4] for w in g)) for g in groups]
+    sc = [sum(1 for t in toks if t in tx) for tx in texts]
+    best, bi = 0.0, -1
+    for i in range(len(groups)):
+        v = sum(sc[i:i + span]) + (0.5 if sc[i] else 0)
+        if v > best:
+            best, bi = v, i
+    if bi < 0:
+        return "", []
+    sel = groups[bi:bi + span]
+    rects = []
+    for g in sel:
+        r = fitz.Rect(g[0][:4])
+        for w in g[1:]:
+            r = r | fitz.Rect(w[:4])
+        rects.append(r)
+    text = "\n".join(unicodedata.normalize("NFKC", " ".join(w[4] for w in g)) for g in sel)
+    return text, rects
+
+
+def locate_local(path, key, query):
+    """بحث محلي فوري بدون ذكاء اصطناعي: رقم الصفحة + الفقرة + الصفحة مظلّلة."""
+    idx = get_index(path, key)
+    cands, best = rank_pages(idx.norm, query, top_n=3)
+    if not cands or best <= 0:
+        return {"found": False}
+    doc = fitz.open(path)
+    try:
+        pi = cands[0]
+        text, rects = local_snippet(doc[pi], query_tokens(query))
+        return {"found": True, "page_number": pi + 1, "pdf_page": pi + 1, "snippet": text,
+                "page_image": render_page(doc, pi, rects)}
+    finally:
+        doc.close()
+
+
+def local_fallback(doc, pi, toks):
+    text, rects = local_snippet(doc[pi], toks)
+    return {"page_number": pi + 1, "pdf_page": pi + 1, "answer": text or NO_MATCH, "highlight": "",
+            "page_image": render_page(doc, pi, rects),
+            "note": "الذكاء الاصطناعي مشغول الآن، وهذه أقرب فقرة في الكتاب لسؤالك.", "_cache": False}
+
+
 def answer_question(path, key, query):
     idx = get_index(path, key)
     ensure_ocr(path, key, idx, wait=45)
     pct = idx.pct()
     note = None if pct >= 100 else f"جاري تجهيز الكتاب (تمت قراءة {pct}% من صفحاته). أعد السؤال بعد قليل لنتيجة أدق."
+    n_pages = len(idx.norm)
     cands, best = rank_pages(idx.norm, query, top_n=3)
+    # ملف ممسوح صغير (حتى 6 صفحات): نرسل صفحاته كصور مباشرة بدون انتظار OCR
+    tiny_scan = (not cands or best <= 0) and idx.needs_ocr() and 0 < n_pages <= 6
+    if tiny_scan:
+        cands, best, note = list(range(n_pages)), 1.0, None
     if not cands or best <= 0:
         return {"page_number": None, "pdf_page": None, "answer": NO_MATCH, "highlight": "",
                 "page_image": None, "note": note, "_cache": False}
 
+    toks = query_tokens(query)
     doc = fitz.open(path)
     try:
         text_cands = [i for i in cands if i not in idx.ocr_done and idx.len[i] >= 120]
+        use_text = bool(text_cands) and cands[0] in text_cands and not tiny_scan
         pages, dims = [], {}
-        if text_cands and cands[0] in text_cands:
-            cands = text_cands[:TEXT_PAGES]   # كتاب نصي: نص فقط وصفحتان فقط (الأسرع)
-            for i in cands:
-                pages.append({"label": f"[صفحة رقم {i + 1}]", "text": words_to_text(page_words(doc[i]))})
-            raw, provider = run_models(pages, lambda p: text_instructions(query), max_tokens=400)
-        else:
-            cands = cands[:2]  # صفحات ممسوحة: صورتان فقط
-            for i in cands:
-                pix = doc[i].get_pixmap(dpi=ANALYSIS_DPI)
-                dims[i] = (pix.width, pix.height)
-                pages.append({"label": f"صفحة رقم {i + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):",
-                              "jpeg": pix.tobytes("jpeg", jpg_quality=75)})
-            raw, provider = run_models(pages, lambda p: image_instructions(query, p), max_tokens=450)
+        try:
+            if use_text:
+                cands = text_cands[:TEXT_PAGES]   # كتاب نصي: نص فقط (الأسرع)
+                for i in cands:
+                    pages.append({"label": f"[صفحة رقم {i + 1}]", "text": words_to_text(page_words(doc[i]), 2600)})
+                raw, provider = run_models(pages, lambda p: text_instructions(query), max_tokens=400)
+            else:
+                cands = cands[:n_pages] if tiny_scan else cands[:2]
+                for i in cands:
+                    pix = doc[i].get_pixmap(dpi=ANALYSIS_DPI)
+                    dims[i] = (pix.width, pix.height)
+                    pages.append({"label": f"صفحة رقم {i + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):",
+                                  "jpeg": pix.tobytes("jpeg", jpg_quality=75)})
+                raw, provider = run_models(pages, lambda p: image_instructions(query, p), max_tokens=450)
+        except AIUnavailable:
+            if use_text:
+                return local_fallback(doc, cands[0], toks)
+            raise
 
         answer, page_idx, printed, boxes, highlight = parse_reply(raw, cands)
         rects = []
@@ -913,6 +992,28 @@ def custom_ask(request: Request, file_id: str = Query(...), query: str = Query(.
     return respond(lambda: cached_answer(path, file_id, query))
 
 
+@app.get("/api/locate")
+def locate_in_book(request: Request, book_code: str = Query(...), query: str = Query(..., min_length=2, max_length=300)):
+    if not rate_ok(request, "loc", 60):
+        return too_many()
+    path = book_path(book_code)
+    if not path:
+        return JSONResponse(status_code=404, content={"found": False})
+    return respond(lambda: locate_local(path, book_key(path), query))
+
+
+@app.get("/api/custom/locate")
+def custom_locate(request: Request, file_id: str = Query(...), query: str = Query(..., min_length=2, max_length=300)):
+    if not rate_ok(request, "loc", 60):
+        return too_many()
+    if not re.fullmatch(r"[0-9a-f]{40}", file_id):
+        return JSONResponse(status_code=400, content={"found": False})
+    path = os.path.join(UPLOAD_DIR, file_id + ".pdf")
+    if not os.path.exists(path):
+        return JSONResponse(status_code=410, content={"found": False})
+    return respond(lambda: locate_local(path, file_id, query))
+
+
 # ───────────── لوحة الإدارة ─────────────
 _ADMIN_FAILS = {}
 
@@ -1012,6 +1113,35 @@ def admin_catalog(request: Request, key: str = Form(...), group: str = Form(...)
             ov.pop(group, None)
         _write_json("catalog.json", ov)
         return {"ok": True, "count": len(rows)}
+    return respond(go)
+
+
+@app.post("/api/admin/ai-test")
+def admin_ai_test(request: Request, key: str = Form(...)):
+    """يجرّب كل موديل بطلب صغير ويعرض سبب الفشل بالضبط (مفتاح خاطئ، اسم موديل غير صحيح، رصيد...)."""
+    def go():
+        _admin(key, request)
+        pages = [{"label": "[اختبار]", "text": "المطلوب: اكتب كلمة واحدة فقط وهي: تم"}]
+        jobs = []
+        if client:
+            jobs.append(("claude", CLAUDE_MODEL))
+            if CLAUDE_FALLBACK and CLAUDE_FALLBACK != CLAUDE_MODEL:
+                jobs.append(("claude", CLAUDE_FALLBACK))
+        if gemini_client:
+            jobs += [("gemini", m) for m in GEMINI_MODELS]
+        results = []
+        for provider, model in jobs:
+            t0 = time.time()
+            try:
+                out = (call_claude(pages, "أجب بكلمة واحدة.", 30, model) if provider == "claude"
+                       else call_gemini(model, pages, "أجب بكلمة واحدة.", 30))
+                results.append({"provider": provider, "model": model, "ok": bool(out),
+                                "ms": int((time.time() - t0) * 1000), "error": "" if out else "رد فارغ"})
+            except Exception as e:
+                results.append({"provider": provider, "model": model, "ok": False,
+                                "ms": int((time.time() - t0) * 1000), "error": f"{type(e).__name__}: {str(e)[:220]}"})
+        return {"results": results, "anthropic_key": bool(ANTHROPIC_API_KEY), "gemini_key": bool(GEMINI_API_KEY),
+                "recent_errors": LAST_AI_ERRORS[-5:]}
     return respond(go)
 
 
@@ -1203,6 +1333,14 @@ display:flex;padding:6px;gap:4px;background:rgba(6,41,31,.82);backdrop-filter:bl
 #zoom.on{display:block}
 #zoom img{display:block;width:max(100%,900px);margin:46px auto 0;border-radius:6px;touch-action:pan-x pan-y pinch-zoom}
 #zoom button{position:fixed;top:calc(10px + env(safe-area-inset-top,0px));inset-inline-start:12px;background:var(--gold);color:#2b2108;border-radius:999px;padding:6px 18px;font-weight:700;z-index:51}
+.aiwait{display:flex;align-items:center;gap:10px;margin:0 0 12px;padding:10px 14px;border-radius:14px;background:rgba(20,148,109,.12);border:1px solid var(--emerald);color:var(--emerald);font-weight:600;font-size:.92rem}
+.aiwait .dot{width:10px;height:10px;border-radius:50%;background:var(--gold);animation:pulse 1.2s ease-in-out infinite;flex:none}
+.okchip{flex-wrap:wrap;justify-content:space-between}
+.okchip bdi{flex-basis:100%;font-size:.78rem;font-weight:400;opacity:.8;overflow-wrap:anywhere;direction:ltr;text-align:start}
+.crumbs span{max-width:56vw;overflow:hidden;text-overflow:ellipsis}
+.shero::before{opacity:.45}
+.top h1{font-size:1.3rem}
+.res blockquote{white-space:pre-line}
 </style>
 </head>
 <body>
@@ -1222,24 +1360,24 @@ pickStage:'اختر مرحلتك',pickYear:'اختر الصف',pickTerm:'اخت�
 customTitle:'ارفع كتابك الخاص',customSub:'أي ملف PDF حتى 500 ميجابايت. ارفعه مرة واحدة واسأل عنه بقدر ما تريد.',
 dropT:'اختر ملف PDF',dropS:'الحد الأعلى 500 ميجابايت',uploading:'جاري الرفع',ready:'الكتاب جاهز',pagesN:'صفحة',tooBig:'حجم الملف أكبر من 500 ميجابايت.',
 ask:'اسأل الكتاب بالذكاء الاصطناعي',askHint:'إجابة سريعة مع رقم الصفحة وتظليل الجواب',
-book:'الكتاب (غير محلول)',bookHint:'افتح الكتاب PDF كاملاً',bookIen:'الكتاب من منصة عين',bookIenHint:'الملف لم يُضف بعد، افتح المصدر الرسمي',
+book:'الكتاب (بدون حل)',bookHint:'افتح الكتاب PDF كاملاً',bookIen:'الكتاب من منصة عين',bookIenHint:'الملف لم يُضف بعد، افتح المصدر الرسمي',
 solved:'الكتاب محلول',solvedHint:'الكتاب مع الحلول',videos:'شرح الدروس',videosHint:'من قناة عين التعليمية على يوتيوب',
 soon:'قريباً',notAvail:'ملف هذا الكتاب لم يُضف بعد',qLabel:'اكتب سؤالك',qPh:'مثال: ما هو قانون كبلر الأول؟',
 search:'ابحث في الكتاب',page:'الصفحة',pdfPage:'ترتيبها في الملف',fromBook:'من نص الكتاب',pageCap:'اضغط على الصفحة لتكبيرها',retry:'أعد المحاولة',close:'إغلاق',
 l1:'أبحث في صفحات الكتاب…',l2:'أقرأ الصفحات الأقرب لسؤالك…',l3:'أجهّز الإجابة…',l4:'الكتاب كبير، أجهّز صفحاته لأول مرة…',
-errServer:'تعذّر الاتصال بالخادم. أعد المحاولة بعد لحظات.',errSlow:'استغرق الرد وقتاً طويلاً. أعد المحاولة.',errNet:'تحقق من اتصالك بالإنترنت ثم أعد المحاولة.'},
+errServer:'تعذّر الاتصال بالخادم. أعد المحاولة بعد لحظات.',errSlow:'استغرق الرد وقتاً طويلاً. أعد المحاولة.',errNet:'تحقق من اتصالك بالإنترنت ثم أعد المحاولة.',aiThinking:'الذكاء الاصطناعي يصيغ لك الإجابة…',aiFail:'تعذّر توليد الإجابة الآن، وهذه أقرب فقرة في الكتاب لسؤالك.'},
 en:{title:'Smart Curriculum Platform',sub:'Ask your textbook and get the answer with the page number',
 heroT:'Ask your book<br>get the page',heroBtn:'Upload a book and ask',home:'Home',upload:'Upload',lang:'عربي',
 pickStage:'Choose your stage',pickYear:'Choose a grade',pickTerm:'Choose a semester',pickSubject:'Choose a subject',yearsN:'academic years',subjectsN:'subjects',
 customTitle:'Upload your own book',customSub:'Any PDF up to 500 MB. Upload once, ask as much as you like.',
 dropT:'Choose a PDF',dropS:'Up to 500 MB',uploading:'Uploading',ready:'Book ready',pagesN:'pages',tooBig:'File is larger than 500 MB.',
 ask:'Ask the book with AI',askHint:'Quick answer with page number and highlight',
-book:'Textbook (unsolved)',bookHint:'Open the full PDF',bookIen:'Book on Ein platform',bookIenHint:'File not added yet, open the official source',
+book:'Textbook (without solutions)',bookHint:'Open the full PDF',bookIen:'Book on Ein platform',bookIenHint:'File not added yet, open the official source',
 solved:'Solved book',solvedHint:'Textbook with solutions',videos:'Lesson videos',videosHint:'From the Ein channel on YouTube',
 soon:'Soon',notAvail:'This book file has not been added yet',qLabel:'Type your question',qPh:'e.g. What is Kepler’s first law?',
 search:'Search the book',page:'Page',pdfPage:'File page',fromBook:'From the book',pageCap:'Tap the page to zoom',retry:'Try again',close:'Close',
 l1:'Searching the book pages…',l2:'Reading the closest pages…',l3:'Preparing the answer…',l4:'Big book, preparing its pages for the first time…',
-errServer:'Could not reach the server. Try again in a moment.',errSlow:'The reply took too long. Try again.',errNet:'Check your connection and try again.'}};
+errServer:'Could not reach the server. Try again in a moment.',errSlow:'The reply took too long. Try again.',errNet:'Check your connection and try again.',aiThinking:'AI is writing your answer…',aiFail:'Could not generate the answer now; this is the closest passage in the book.'}};
 
 const state={lang:'ar',cat:null,view:'home',stage:null,year:null,term:null,subject:null,custom:null,up:{mode:'idle'}};
 const ADMIN=new URLSearchParams(location.search).has('admin');
@@ -1326,7 +1464,7 @@ const views={
   return `<div class="shero" style="--c:${colorOf(s.code)}"><span class="em">${emo(s.code)}</span><div><h2 class="k">${esc(nm(s))}</h2><p>${esc(nm(Y()))} · ${esc(nm(Tm()))}</p></div></div>`+
    (s.pdf?`<button class="row ai" onclick="go('ask')"><span class="ic">${ico('spark')}</span><span><b>${t('ask')}</b><small>${t('askHint')}</small></span><span class="ar">‹</span></button>`
          :rowOff('spark',t('ask'),t('notAvail')))+
-   (book?rowA(book,'book',t('book'),t('bookHint')):rowA(state.cat.ien,'ext',t('bookIen'),t('bookIenHint')))+
+   (book?rowA(book,'book',t('book'),t('bookHint')):rowOff('book',t('book'),t('soon')))+
    (sol?rowA(sol,'check',t('solved'),t('solvedHint')):rowOff('check',t('solved'),t('soon')))+
    rowA(s.video,'play',t('videos'),t('videosHint'))+
    (ADMIN?`<p class="hint">books/${esc(s.code)}.pdf · books/${esc(s.code)}_solved.pdf</p>`:'');
@@ -1348,7 +1486,7 @@ const views={
 function upHTML(){
   const u=state.up;
   if(u.mode==='prog')return `<div class="prog"><i style="width:${u.pct}%"></i></div><p class="hint" style="margin:6px 2px 0">${t('uploading')} ${u.pct}% · ${esc(u.name)}</p>`;
-  if(u.mode==='ok'&&state.custom)return `<div class="okchip">✓ ${esc(state.custom.name)} · ${state.custom.pages} ${t('pagesN')} — ${t('ready')}</div>`;
+  if(u.mode==='ok'&&state.custom)return `<div class="okchip"><span>✓ ${t('ready')} · ${state.custom.pages} ${t('pagesN')}</span><bdi>${esc(state.custom.name)}</bdi></div>`;
   if(u.mode==='err')return `<div class="errchip">${esc(u.msg)}</div>`;
   return '';
 }
@@ -1373,6 +1511,7 @@ function render(){
   $('nav').innerHTML=nb(state.view!=='custom','go(\'home\')','home',t('home'))+nb(state.view==='custom','go(\'custom\')','up',t('upload'))+nb(false,'toggleLang()','globe',t('lang'));
   if(!state.cat){$('app').innerHTML='<div class="loading"><div class="sk"></div><div class="sk"></div><div class="sk"></div></div>';return}
   $('app').innerHTML=(state.view==='home'?'':crumbs())+views[state.view]();
+  const cr=document.querySelector('.crumbs');if(cr)cr.scrollLeft=state.lang==='ar'?-cr.scrollWidth:cr.scrollWidth;
 }
 
 let timer=null,lastRun=null;
@@ -1382,39 +1521,55 @@ function loading(){
   clearInterval(timer);timer=setInterval(()=>{i=Math.min(i+1,m.length-1);const e=$('lm');if(e)e.textContent=m[i===2&&Math.random()<.5?3:i]},3000);
 }
 function showError(msg,retry){
-  $('out').innerHTML=`<div class="err"><p>${esc(msg)}</p></div>`+(retry?`<button class="btn alt" onclick="run(lastRun)">${t('retry')}</button>`:'');
+  $('out').innerHTML=`<div class="err"><p>${esc(msg)}</p></div>`+(retry?`<button class="btn alt" onclick="lastRun()">${t('retry')}</button>`:'');
 }
-function showResult(d){
+function showResult(d,o){
+  o=o||{};
   const same=d.pdf_page===d.page_number;
-  $('out').innerHTML=`<div class="res"><div class="rtop">${d.page_number?`<div class="med"><small>${t('page')}</small><b>${esc(d.page_number)}</b></div>`:''}${same||!d.pdf_page?'':`<span class="fp">${t('pdfPage')}: ${esc(d.pdf_page)}</span>`}</div>
+  $('out').innerHTML=`<div class="res"><div class="rtop">${d.page_number?`<div class="med"><small>${t('page')}</small><b>${esc(d.page_number)}</b></div>`:''}${same||!d.pdf_page||o.pending?'':`<span class="fp">${t('pdfPage')}: ${esc(d.pdf_page)}</span>`}</div>
    ${d.note?`<p class="note">${esc(d.note)}</p>`:''}
-   <p class="atext">${esc(d.answer)}</p>
+   ${o.pending?`<p class="aiwait"><span class="dot"></span>${t('aiThinking')}</p>`:''}
+   ${d.answer?`<p class="atext">${esc(d.answer)}</p>`:''}
    ${d.highlight?`<blockquote><small>${t('fromBook')}</small>${esc(d.highlight)}</blockquote>`:''}
    ${d.page_image?`<figure><img src="${d.page_image}" alt="" onclick="zoomImg(this.src)"><figcaption>${t('pageCap')}</figcaption></figure>`:''}</div>`;
-  $('out').scrollIntoView({behavior:'smooth',block:'start'});
+  if(!o.noscroll)$('out').scrollIntoView({behavior:'smooth',block:'start'});
 }
 function zoomImg(src){$('zimg').src=src;$('zoom').classList.add('on')}
-async function run(doFetch){
-  lastRun=doFetch;$('go').disabled=true;loading();
+let runId=0;
+function localView(d,note){return {page_number:d.page_number,pdf_page:d.pdf_page,highlight:d.snippet,page_image:d.page_image,note:note}}
+async function runAsk(urlLocate,urlAsk){
+  const my=++runId;lastRun=()=>runAsk(urlLocate,urlAsk);
+  $('go').disabled=true;loading();
   const ctrl=new AbortController(),to=setTimeout(()=>ctrl.abort(),130000);
+  let local=null,done=false;
+  fetch(urlLocate,{signal:ctrl.signal}).then(r=>r.ok?r.json():null).then(d=>{
+    if(d&&d.found&&!done&&my===runId){local=d;clearInterval(timer);showResult(localView(d),{pending:true})}
+  }).catch(()=>{});
   try{
-    const r=await doFetch(ctrl.signal);const txt=await r.text();let d;
+    const r=await fetch(urlAsk,{signal:ctrl.signal});const txt=await r.text();let d;
     try{d=JSON.parse(txt)}catch(_){d={error_ar:t('errServer')}}
-    clearInterval(timer);
-    if(r.ok)showResult(d);else showError(d.error_ar||d.error||t('errServer'),d.retry!==false);
-  }catch(e){clearInterval(timer);showError(e.name==='AbortError'?t('errSlow'):t('errNet'),true)}
-  finally{clearTimeout(to);const b=$('go');if(b)b.disabled=false}
+    if(my!==runId)return;
+    done=true;clearInterval(timer);
+    if(r.ok)showResult(d,{noscroll:!!local});
+    else if(local)showResult(localView(local,t('aiFail')),{noscroll:true});
+    else showError(d.error_ar||d.error||t('errServer'),d.retry!==false);
+  }catch(e){
+    if(my!==runId)return;
+    done=true;clearInterval(timer);
+    if(local)showResult(localView(local,t('aiFail')),{noscroll:true});
+    else showError(e.name==='AbortError'?t('errSlow'):t('errNet'),true);
+  }finally{clearTimeout(to);if(my===runId){const b=$('go');if(b)b.disabled=false}}
 }
 function doAsk(){
   const q=$('q').value.trim();if(!q){$('q').focus();return}
-  const code=Sub().code;
-  run(sig=>fetch(`/api/search?book_code=${encodeURIComponent(code)}&query=${encodeURIComponent(q)}`,{signal:sig}));
+  const c=encodeURIComponent(Sub().code),qq=encodeURIComponent(q);
+  runAsk(`/api/locate?book_code=${c}&query=${qq}`,`/api/search?book_code=${c}&query=${qq}`);
 }
 function doCustom(){
   if(!state.custom){$('f').click();return}
   const q=$('q').value.trim();if(!q){$('q').focus();return}
-  const id=state.custom.id;
-  run(sig=>fetch(`/api/custom/ask?file_id=${id}&query=${encodeURIComponent(q)}`,{signal:sig}));
+  const id=state.custom.id,qq=encodeURIComponent(q);
+  runAsk(`/api/custom/locate?file_id=${id}&query=${qq}`,`/api/custom/ask?file_id=${id}&query=${qq}`);
 }
 
 (async function init(){
@@ -1468,6 +1623,7 @@ table{width:100%;border-collapse:collapse;font-size:.8rem}td,th{border-bottom:1p
 <textarea id="subs"></textarea>
 <button onclick="saveSubs()">حفظ مواد هذا الفصل</button><div class="msg" id="m4"></div></div>
 
+<div class="card"><h2>5) فحص الذكاء الاصطناعي</h2><p class="hint">يجرّب كل موديل ويعرض سبب الفشل (مفتاح خاطئ، اسم موديل غير صحيح، انتهاء الرصيد...).</p><button onclick="aiTest()">افحص الآن</button><div class="msg" id="m5"></div></div>
 <div class="card"><h2>حالة الكتب</h2><div id="tbl" class="hint">...</div></div></div>
 <script>
 let cat;const $=i=>document.getElementById(i);
@@ -1497,6 +1653,12 @@ async function link(){const fd=new FormData();fd.append('key',key());fd.append('
 async function saveSubs(){const fd=new FormData();fd.append('key',key());fd.append('group',group());fd.append('text',$('subs').value);
  const r=await fetch('/api/admin/catalog',{method:'POST',body:fd});const d=await r.json();$('m4').className='msg '+(r.ok?'ok':'bad');
  $('m4').textContent=r.ok?('تم الحفظ ('+d.count+' مادة)'):(d.error_ar||'فشل');if(r.ok)load(true)}
+async function aiTest(){const fd=new FormData();fd.append('key',key());$('m5').className='msg';$('m5').textContent='جاري الفحص...';
+ const r=await fetch('/api/admin/ai-test',{method:'POST',body:fd});const d=await r.json();
+ if(!r.ok){$('m5').className='msg bad';$('m5').textContent=d.error_ar||'فشل';return}
+ let h=d.results.map(x=>`<div class="${x.ok?'ok':'bad'}" dir="ltr">${x.provider} / ${x.model}: ${x.ok?('OK ('+x.ms+' ms)'):('ERROR '+x.error)}</div>`).join('');
+ if(!d.results.length)h='<div class="bad">لا يوجد أي مفتاح مضبوط (ANTHROPIC_API_KEY / GEMINI_API_KEY)</div>';
+ $('m5').innerHTML=h}
 async function load(keepText){cat=await (await fetch('/api/catalog')).json();
  const keep=[$('st').value,$('yr').value,$('tm').value,$('sb').value];
  fill($('st'),cat.stages,s=>s.ar);if(keep[0])$('st').value=keep[0];fill($('yr'),cat.stages[$('st').value].years,y=>y.ar);if(keep[1])$('yr').value=keep[1];

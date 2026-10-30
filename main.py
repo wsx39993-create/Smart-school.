@@ -6,12 +6,15 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # المفتاح يُقرأ من متغيرات البيئة (Render -> Environment -> GEMINI_API_KEY)
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# اسم الموديل (الخطأ نفسه من جوجل اقترح هذا الاسم)
+MODEL_NAME = "gemini-3.8-flash"
 
 app = FastAPI(title="Smart Curriculum Educational Platform")
 
@@ -24,9 +27,6 @@ app.add_middleware(
 )
 
 BOOKS_DIR = os.path.join(os.path.dirname(__file__), "books")
-
-def get_gemini_model():
-    return genai.GenerativeModel('gemini-2.5-flash')
 
 def search_pdf_text(pdf_path: str, query: str):
     doc = fitz.open(pdf_path)
@@ -76,16 +76,18 @@ def search_in_book(book_code: str = Query(...), query: str = Query(...)):
         pix = page.get_pixmap(dpi=120)
         img_bytes = pix.tobytes("png")
 
-        model = get_gemini_model()
         prompt = (
             f"أنت معلم وخبير في المناهج الدراسية. بناءً على صفحة الكتاب المرفقة، أجب بدقة على السؤال التالي: '{query}'.\n"
             f"إذا وجدت الإجابة في الصفحة، حدد النص الدقيق المستخرج للإجابة في السطر الأخير مسبوقاً بـ 'EXACT_TEXT:'."
         )
 
-        response = model.generate_content([
-            prompt,
-            {"mime_type": "image/png", "data": img_bytes}
-        ])
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+            ],
+        )
 
         answer_text = response.text if response.text else "لم يتم العثور على إجابة واضحة."
         highlight_str = ""
@@ -129,13 +131,12 @@ async def search_custom_pdf(file: UploadFile = File(...), query: str = Form(...)
         page = doc[best_page_idx]
         text_content = page.get_text("text")
 
-        model = get_gemini_model()
         prompt = (
             f"بناءً على نص الصفحة التالية من المستند، أجب بوضوح ودقة على السؤال التالي: '{query}'.\n\n"
             f"نص الصفحة:\n{text_content[:3000]}"
         )
 
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
         answer_text = response.text if response and response.text else "لم يتم العثور على إجابة كافية في هذه الصفحة."
 
         img_b64 = render_page_with_highlight(doc, best_page_idx, "")

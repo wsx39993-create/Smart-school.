@@ -1,13 +1,21 @@
 """control.py — لوحة تحكم شاملة للمنصة: إحصائيات، إعلانات، أرباح، إدارة الكتب والملفات، فحص النظام.
 ضعه بجانب main.py (يستبدل analytics.py القديم) وطبّق 3 أسطر فقط في main.py (راجع الشرح).
+
+نسخة مُصلَحة: لا تعلّق + حفظ الكتب مضمون
+  1) تسجيل الزيارات صار في خيط خلفي (قائمة انتظار) ولا يلمس قاعدة البيانات داخل حلقة الخادم أبداً.
+  2) استُبدل الـ middleware القديم (BaseHTTPMiddleware) بـ ASGI خالص لا يعلّق مع رفع الملفات الكبيرة.
+  3) رفع الكتب يُكتب مباشرة على القرص مع fsync وفحص PDF والتحقق من المساحة، ثم يُنقل بشكل ذري.
+  4) قاعدة البيانات بوضع WAL والإعدادات في ذاكرة مؤقتة، فلا تتوقف الصفحات أثناء الكتابة على القرص.
 """
 import os
 import re
 import sys
 import json
+import queue
 import shutil
 import sqlite3
 import hashlib
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -21,29 +29,46 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
 TZ = timezone(timedelta(hours=3))   # توقيت السعودية
 SALT = os.environ.get("ANALYTICS_SALT", "smart-curriculum")
 _BOT = re.compile(r"bot|crawl|spider|slurp|uptimerobot|pingdom|curl|python-requests|headless|render/", re.I)
-_lock = threading.Lock()
+_wlock = threading.Lock()          # قفل الكتابة فقط (القراءة بدون قفل بفضل WAL)
 _db_path = None
 M = {}   # مساحة أسماء main.py (تُمرَّر في setup)
+_EVQ = queue.Queue(maxsize=10000)   # أحداث الزيارات بانتظار الكتابة في الخلفية
+_SET_CACHE = {}                     # ذاكرة مؤقتة للإعدادات: k -> (وقت, قيمة)
+_SET_TTL = 10
 
 
 # ───────────── قاعدة البيانات ─────────────
+def _conn():
+    c = sqlite3.connect(_db_path, timeout=5)
+    c.row_factory = sqlite3.Row
+    return c
+
+
 def _q(sql, args=(), write=False):
-    with _lock:
-        c = sqlite3.connect(_db_path, timeout=10)
-        c.row_factory = sqlite3.Row
-        try:
-            cur = c.execute(sql, args)
-            if write:
+    if write:
+        with _wlock:
+            c = _conn()
+            try:
+                c.execute(sql, args)
                 c.commit()
                 return []
-            return cur.fetchall()
-        finally:
-            c.close()
+            finally:
+                c.close()
+    c = _conn()
+    try:
+        return c.execute(sql, args).fetchall()
+    finally:
+        c.close()
 
 
 def _init():
-    c = sqlite3.connect(_db_path, timeout=10)
+    c = sqlite3.connect(_db_path, timeout=5)
     try:
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         c.executescript("""
             CREATE TABLE IF NOT EXISTS events(ts INTEGER, day TEXT, type TEXT, visitor TEXT, meta TEXT);
             CREATE INDEX IF NOT EXISTS ev_day ON events(day, type);
@@ -56,12 +81,23 @@ def _init():
 
 
 def get_set(k, default=""):
-    r = _q("SELECT v FROM settings WHERE k=?", (k,))
-    return r[0]["v"] if r else default
+    hit = _SET_CACHE.get(k)
+    if hit and time.time() - hit[0] < _SET_TTL:
+        v = hit[1]
+    else:
+        try:
+            r = _q("SELECT v FROM settings WHERE k=?", (k,))
+            v = r[0]["v"] if r else None
+        except Exception as e:
+            print("[control] get_set:", type(e).__name__, str(e)[:100])
+            v = hit[1] if hit else None
+        _SET_CACHE[k] = (time.time(), v)
+    return default if v is None else v
 
 
 def put_set(k, v):
     _q("INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)), True)
+    _SET_CACHE[k] = (time.time(), str(v))
 
 
 def ads_cfg():
@@ -76,6 +112,28 @@ def ads_cfg():
             "on": bool(c.get("on", True))}
 
 
+def _writer():
+    """خيط واحد يكتب الأحداث على دفعات، فلا يتأثر الموقع ببطء القرص أثناء رفع الكتب."""
+    while True:
+        batch = [_EVQ.get()]
+        try:
+            while len(batch) < 300:
+                batch.append(_EVQ.get_nowait())
+        except queue.Empty:
+            pass
+        try:
+            with _wlock:
+                c = sqlite3.connect(_db_path, timeout=5)
+                try:
+                    c.executemany("INSERT INTO events(ts,day,type,visitor,meta) VALUES(?,?,?,?,?)", batch)
+                    c.commit()
+                finally:
+                    c.close()
+        except Exception as e:
+            print("[control] writer:", type(e).__name__, str(e)[:120])
+        time.sleep(1.0)
+
+
 def _log(typ, request, meta=""):
     ua = request.headers.get("user-agent", "")
     if _BOT.search(ua):
@@ -83,8 +141,10 @@ def _log(typ, request, meta=""):
     now = datetime.now(TZ)
     day = now.strftime("%Y-%m-%d")
     vid = hashlib.sha256(f"{SALT}{day}{M['client_ip'](request)}{ua}".encode()).hexdigest()[:16]
-    _q("INSERT INTO events(ts,day,type,visitor,meta) VALUES(?,?,?,?,?)",
-       (int(now.timestamp()), day, typ, vid, (meta or "")[:200]), True)
+    try:
+        _EVQ.put_nowait((int(now.timestamp()), day, typ, vid, (meta or "")[:200]))
+    except queue.Full:
+        pass   # نتجاهل الحدث بدل تعطيل الموقع
 
 
 # ───────────── الإحصائيات ─────────────
@@ -171,9 +231,18 @@ def _uploads():
     return sorted(out, key=lambda x: x["age"])
 
 
+def _mount_of(path):
+    p = os.path.abspath(path)
+    while not os.path.ismount(p) and p != os.path.dirname(p):
+        p = os.path.dirname(p)
+    return p
+
+
 def _sysinfo():
     du = shutil.disk_usage(M["BOOKS_DIR"])
+    mount = _mount_of(M["BOOKS_DIR"])
     return {"disk_total": du.total, "disk_free": du.free,
+            "persistent": mount not in ("/", ""), "mount": mount,
             "books_size": _dir_size(M["BOOKS_DIR"], (".pdf",)),
             "cache_size": _dir_size(M["CACHE_DIR"]), "db_size": os.path.getsize(_db_path) if os.path.exists(_db_path) else 0,
             "uploads_size": _dir_size(M["UPLOAD_DIR"]), "books_dir": M["BOOKS_DIR"],
@@ -308,10 +377,10 @@ async function api(url,opts){opts=opts||{};opts.headers=Object.assign(H(),opts.h
   if(!r.ok){const e=new Error(d.error_ar||d.error||'فشل');e.status=r.status;throw e}return d}
 const form=o=>{const f=new FormData();for(const k in o)f.append(k,o[k]);return f};
 const post=(u,o)=>api(u,{method:'POST',body:form(o)});
-function upload(url,fd,label){return new Promise((res,rej)=>{const x=new XMLHttpRequest();x.open('POST',url);x.setRequestHeader('X-Admin-Key',KEY);
+function upload(url,fd,label){return new Promise((res,rej)=>{const x=new XMLHttpRequest();x.open('POST',url);x.setRequestHeader('X-Admin-Key',KEY);x.timeout=0;
   const pb=$('pb'),bar=pb.firstElementChild;pb.style.display='block';bar.style.width='0';$('pbt').textContent=label+' 0%';
-  x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';$('pbt').textContent=label+' '+p+'%'}};
-  x.onload=()=>{pb.style.display='none';let d={};try{d=JSON.parse(x.responseText)}catch(_){}x.status===200?res(d):rej(new Error(d.error_ar||d.error||'فشل الرفع'))};
+  x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);bar.style.width=p+'%';$('pbt').textContent=(p>=100?'جاري الحفظ على القرص... ':label+' ')+p+'%'}};
+  x.onload=()=>{pb.style.display='none';let d={};try{d=JSON.parse(x.responseText)}catch(_){}x.status===200?res(d):rej(new Error(d.error_ar||d.error||'فشل الرفع ('+x.status+')'))};
   x.onerror=()=>{pb.style.display='none';rej(new Error('انقطع الاتصال'))};x.send(fd)})}
 async function login(){KEY=$('key').value||KEY;try{await api('/api/ctl/ping');sessionStorage.setItem('dk',KEY);$('login').style.display='none';$('app').style.display='block';show('ov')}catch(e){toast(e.message,1)}}
 function logout(){sessionStorage.removeItem('dk');$('login').style.display='block';$('app').style.display='none'}
@@ -389,7 +458,7 @@ function bookCard(b){const lk=b.lk||{},c=b.code;
    <button class="btn s full" onclick="saveLinks('${c}',this)">حفظ الروابط</button></details></div>`}
 async function refreshBooks(){BOOKS=(await api('/api/ctl/books')).books;drawList()}
 async function upBook(code,kind,inp){const f=inp.files[0];if(!f)return;
-  try{await upload('/api/ctl/book/upload',form({code,kind,file:f}),'رفع '+code);toast('تم رفع '+code);await refreshBooks()}catch(e){toast(e.message,1)}}
+  try{const d=await upload('/api/ctl/book/upload',form({code,kind,file:f}),'رفع '+code);toast('تم حفظ '+code+(d.size?' ('+mb(d.size)+')':''));await refreshBooks()}catch(e){toast(e.message,1)}inp.value=''}
 async function delBook(code,kind){if(!confirm('حذف الملف نهائياً؟ '+code))return;try{await post('/api/ctl/book/delete',{code,kind});toast('تم الحذف');await refreshBooks()}catch(e){toast(e.message,1)}}
 async function bulkUp(){const fs=$('bulk').files;if(!fs.length)return;const fd=new FormData();for(const f of fs)fd.append('files',f);
   try{const d=await upload('/api/ctl/book/bulk',fd,'رفع '+fs.length+' ملف');const ok=d.results.filter(r=>r.ok).length;const bad=d.results.filter(r=>!r.ok);
@@ -411,7 +480,8 @@ async function delUp(id){if(!confirm(id==='all'?'حذف كل ملفات الزو
 async function sys(){const s=await api('/api/ctl/system');
   const used=s.disk_total-s.disk_free;
   $('view').innerHTML=`<div class="kpis"><div class="k"><b>${mb(s.books_size)}</b><span>حجم الكتب</span></div><div class="k"><b>${mb(s.cache_size)}</b><span>فهارس البحث</span></div><div class="k"><b>${mb(s.db_size)}</b><span>قاعدة الإحصائيات</span></div><div class="k"><b>${mb(s.disk_free)}</b><span>مساحة متبقية</span></div></div>
-  <div class="card"><h2>💾 التخزين</h2><p class="hint" dir="ltr">${esc(s.books_dir)}</p><p class="hint">استخدام القرص: ${mb(used)} من ${mb(s.disk_total)}. إذا لم يكن المجلد على Persistent Disk في Render فستضيع الكتب والإحصائيات عند إعادة التشغيل.</p></div>
+  <div class="card"><h2>💾 التخزين</h2><p class="hint" dir="ltr">${esc(s.books_dir)}</p><p class="hint">استخدام القرص: ${mb(used)} من ${mb(s.disk_total)}. إذا لم يكن المجلد على Persistent Disk في Render فستضيع الكتب والإحصائيات عند إعادة التشغيل.</p>
+   ${s.persistent?'<p class="ok">✓ المجلد على قرص دائم (<bdi dir="ltr">'+esc(s.mount)+'</bdi>) والكتب لن تضيع.</p>':'<p class="bad">⚠️ المجلد ليس على قرص دائم: الكتب المرفوعة ستُحذف عند كل إعادة تشغيل أو نشر جديد. أضف Persistent Disk في Render (Disks) على المسار /var/data ثم اضبط BOOKS_DIR=/var/data/books.</p>'}</div>
   <div class="card"><h2>🤖 الذكاء الاصطناعي</h2>
    <p>${s.anthropic_key?'<span class="ok">✓</span>':'<span class="bad">✗</span>'} مفتاح Claude &nbsp; ${s.gemini_key?'<span class="ok">✓</span>':'<span class="bad">✗</span>'} مفتاح Gemini &nbsp; ${s.web_search?'<span class="ok">✓</span>':'<span class="bad">✗</span>'} بحث الإنترنت</p>
    <p class="hint" dir="ltr">${esc(s.claude_model)} → ${esc(s.claude_fallbacks.join(', '))}<br>${esc(s.gemini_models.join(', '))}</p>${(s.pruned||[]).length?`<p class="hint">استُبعدت تلقائياً (حصتها منتهية): <bdi dir="ltr">${esc(s.pruned.join(', '))}</bdi></p>`:''}
@@ -468,6 +538,155 @@ def _prune_gemini(wait_s=240):
         return
 
 
+# ───────────── حفظ الكتب (مضمون) ─────────────
+def _store_book(up, code, kind):
+    """يكتب الملف مباشرة على القرص بقطع 1MB مع fsync، يفحص أنه PDF سليم، ثم ينقله بشكل ذري.
+    لا يعتمد على _save_book في main.py، ولا يترك ملفات ناقصة إذا انقطع الرفع أو امتلأ القرص."""
+    Err = M["ApiError"]
+    if code not in M["all_codes"]():
+        raise Err(f"الكود غير موجود في الكتالوج: {code}", 400)
+    books_dir = M["BOOKS_DIR"]
+    os.makedirs(books_dir, exist_ok=True)
+    dest = os.path.join(books_dir, f"{code}{'_solved' if kind == 'solved' else ''}.pdf")
+    tmp = dest + ".part"
+    limit = int(M.get("MAX_UPLOAD", 500 * 1024 * 1024))
+    hint = getattr(up, "size", None)
+    try:
+        free = shutil.disk_usage(books_dir).free
+    except Exception:
+        free = None
+    if hint and free is not None and free < hint * 1.05 + 30 * 1024 * 1024:
+        raise Err(f"المساحة المتبقية على القرص لا تكفي ({free // 1048576} MB). احذف ملفات أو كبّر القرص.", 507)
+    written = 0
+    try:
+        with open(tmp, "wb") as out:
+            while True:
+                chunk = up.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > limit:
+                    raise Err("حجم الملف أكبر من 500 ميجابايت.", 413)
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+    except OSError as e:
+        _rm(tmp)
+        raise Err("تعذّر الكتابة على القرص (ممتلئ أو غير قابل للكتابة): " + str(e)[:80], 507)
+    except Exception:
+        _rm(tmp)
+        raise
+    if written == 0:
+        _rm(tmp)
+        raise Err("الملف فارغ.", 400)
+    try:
+        import fitz
+        d = fitz.open(tmp)
+        n = len(d)
+        d.close()
+        if n < 1:
+            raise ValueError("no pages")
+    except Exception:
+        _rm(tmp)
+        raise Err("الملف ليس PDF صالحاً أو تالف.", 400)
+    os.replace(tmp, dest)
+    try:
+        fd = os.open(books_dir, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+    except Exception:
+        pass
+    # تجهيز فهرس البحث في الخلفية (بدون تعطيل الرد)
+    try:
+        warm, bkey = M.get("warm"), M.get("book_key")
+        if warm and bkey:
+            threading.Thread(target=lambda: warm(dest, bkey(dest)), daemon=True).start()
+    except Exception:
+        pass
+    print(f"[control] saved {dest} ({written} bytes)")
+    return dest
+
+
+def _rm(p):
+    try:
+        os.remove(p)
+    except Exception:
+        pass
+
+
+def _check_admin(request):
+    key = request.headers.get("x-admin-key", "")
+    try:
+        M["_admin"](key, request)
+    except TypeError:
+        M["_admin"](key)
+
+
+# ───────────── تتبع الزيارات + حقن الإعلانات (ASGI خالص، لا يعلّق) ─────────────
+class _TrackMW:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        method, path = scope.get("method", "GET"), scope.get("path", "")
+        state = {"status": 0, "start": None, "buf": []}
+        hold = method == "GET" and path == "/"
+
+        async def wrapped(message):
+            if message["type"] == "http.response.start":
+                state["status"] = message["status"]
+                if hold and message["status"] == 200:
+                    state["start"] = message
+                    return
+            elif message["type"] == "http.response.body" and state["start"] is not None:
+                state["buf"].append(message.get("body", b""))
+                if message.get("more_body"):
+                    return
+                raw = b"".join(state["buf"])
+                try:
+                    raw = inject(raw.decode("utf-8")).encode("utf-8")
+                except Exception as e:
+                    print("[control] inject failed:", type(e).__name__, str(e)[:120])
+                hdrs = [(k, v) for k, v in state["start"]["headers"] if k.lower() != b"content-length"]
+                hdrs.append((b"content-length", str(len(raw)).encode()))
+                start = dict(state["start"])
+                start["headers"] = hdrs
+                state["start"] = None
+                await send(start)
+                await send({"type": "http.response.body", "body": raw})
+                return
+            await send(message)
+
+        await self.app(scope, receive, wrapped)
+        try:
+            self._track(scope, path, method, state["status"] < 400)
+        except Exception as e:
+            print("[control]", type(e).__name__, str(e)[:120])
+
+    @staticmethod
+    def _track(scope, p, m, ok):
+        if p != "/" and not p.startswith("/api/"):
+            return
+        request = Request(scope)
+        qp = request.query_params
+        if m == "GET" and p == "/":
+            ua = request.headers.get("user-agent", "")
+            host = urlparse(request.headers.get("referer", "")).netloc
+            if host == request.headers.get("host", ""):
+                host = ""
+            _log("view", request, ("mobile" if "mobi" in ua.lower() else "desktop") + "\t" + host)
+        elif m == "GET" and p == "/api/search" and ok:
+            _log("ask", request, f"{qp.get('book_code', 'custom')}\t{qp.get('query', '')}")
+        elif m == "GET" and p == "/api/custom/ask" and ok:
+            _log("ask_custom", request, f"custom\t{qp.get('query', '')}")
+        elif m == "POST" and p == "/api/custom/upload" and ok:
+            _log("upload", request)
+        elif m == "GET" and p.startswith("/api/book/") and p.endswith("/pdf") and ok:
+            _log("pdf_open", request, p.split("/")[3])
+
+
 # ───────────── التركيب ─────────────
 def setup(app, ns):
     """ns = globals() الخاصة بـ main.py"""
@@ -476,51 +695,26 @@ def setup(app, ns):
         return
     app._ctl_done = True
     M = ns   # مرجع حي لمساحة أسماء main.py (يُستدعى setup مبكراً قبل تعريف باقي الدوال)
-    _db_path = os.path.join(M["BOOKS_DIR"], "analytics.db")
-    _init()
+    try:
+        _db_path = os.path.join(M["BOOKS_DIR"], "analytics.db")
+        _init()
+    except Exception as e:   # إذا تعذّر القرص نستخدم مجلداً مؤقتاً بدل تعطيل اللوحة كلها
+        print("[control] db on books dir failed, using temp:", type(e).__name__, str(e)[:100])
+        _db_path = os.path.join(tempfile.gettempdir(), "analytics.db")
+        _init()
     _apply_gemini_models()
+    threading.Thread(target=_writer, daemon=True).start()
     threading.Thread(target=_prune_gemini, daemon=True).start()
+    app.add_middleware(_TrackMW)
 
     def err(msg, code=400):
         return JSONResponse(status_code=code, content={"error_ar": msg})
 
     def guard(request, fn):
         def go():
-            M["_admin"](request.headers.get("x-admin-key", ""), request)
+            _check_admin(request)
             return fn()
         return M["respond"](go)
-
-    # تتبع الزيارات
-    @app.middleware("http")
-    async def _track(request: Request, call_next):
-        resp = await call_next(request)
-        try:
-            if request.method == "GET" and request.url.path == "/" and resp.status_code == 200:
-                body = b"".join([chunk async for chunk in resp.body_iterator])
-                hdrs = {k: v for k, v in resp.headers.items() if k.lower() not in ("content-length", "content-type")}
-                resp = HTMLResponse(inject(body.decode("utf-8")), status_code=200, headers=hdrs)
-        except Exception as e:
-            print("[control] inject failed:", type(e).__name__, str(e)[:120])
-        try:
-            p, m, ok = request.url.path, request.method, resp.status_code < 400
-            qp = request.query_params
-            if m == "GET" and p == "/":
-                ua = request.headers.get("user-agent", "")
-                host = urlparse(request.headers.get("referer", "")).netloc
-                if host == request.headers.get("host", ""):
-                    host = ""
-                _log("view", request, ("mobile" if "mobi" in ua.lower() else "desktop") + "\t" + host)
-            elif m == "GET" and p == "/api/search" and ok:
-                _log("ask", request, f"{qp.get('book_code', 'custom')}\t{qp.get('query', '')}")
-            elif m == "GET" and p == "/api/custom/ask" and ok:
-                _log("ask_custom", request, f"custom\t{qp.get('query', '')}")
-            elif m == "POST" and p == "/api/custom/upload" and ok:
-                _log("upload", request)
-            elif m == "GET" and p.startswith("/api/book/") and p.endswith("/pdf") and ok:
-                _log("pdf_open", request, p.split("/")[3])
-        except Exception as e:
-            print("[control]", type(e).__name__, str(e)[:120])
-        return resp
 
     @app.get("/dashboard", response_class=HTMLResponse)
     def dashboard():
@@ -591,8 +785,8 @@ def setup(app, ns):
     @app.post("/api/ctl/book/upload")
     def ctl_book_upload(request: Request, code: str = Form(...), kind: str = Form("pdf"), file: UploadFile = File(...)):
         def go():
-            M["_save_book"](file, code, "solved" if kind == "solved" else "pdf")
-            return {"ok": True}
+            dest = _store_book(file, code, "solved" if kind == "solved" else "pdf")
+            return {"ok": True, "size": os.path.getsize(dest)}
         return guard(request, go)
 
     @app.post("/api/ctl/book/bulk")
@@ -604,10 +798,12 @@ def setup(app, ns):
                 kind = "solved" if base.endswith("_solved") else "pdf"
                 code = base[:-7] if kind == "solved" else base
                 try:
-                    M["_save_book"](up, code, kind)
+                    _store_book(up, code, kind)
                     res.append({"file": up.filename, "ok": True})
                 except M["ApiError"] as e:
                     res.append({"file": up.filename, "ok": False, "error": e.msg})
+                except Exception as e:
+                    res.append({"file": up.filename, "ok": False, "error": str(e)[:100]})
             return {"results": res}
         return guard(request, go)
 
@@ -680,10 +876,7 @@ def setup(app, ns):
         def go():
             ids = [f["id"] for f in _uploads()] if id == "all" else ([id] if re.fullmatch(r"[0-9a-f]{40}", id) else [])
             for i in ids:
-                try:
-                    os.remove(os.path.join(M["UPLOAD_DIR"], i + ".pdf"))
-                except Exception:
-                    pass
+                _rm(os.path.join(M["UPLOAD_DIR"], i + ".pdf"))
             return {"ok": True, "deleted": len(ids)}
         return guard(request, go)
 

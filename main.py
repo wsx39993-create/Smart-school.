@@ -53,6 +53,8 @@ ANALYSIS_DPI = 120
 OCR_DPI = 110
 DISPLAY_DPI = 110
 HEDGE_SECONDS = float(os.environ.get("HEDGE_SECONDS", "4.0"))              # إذا تأخر الموديل الأول أكثر من هذا يبدأ الثاني بالتوازي (أسرع نتيجة تفوز)
+WEB_SEARCH = os.environ.get("WEB_SEARCH", "1") == "1"   # بحث قوقل/الإنترنت للتحقق قبل الإجابة (اضبطه 0 لإيقافه)
+WEB_TIMEOUT = float(os.environ.get("WEB_TIMEOUT", "12"))
 CAND_PAGES = 5                   # عدد الصفحات المرشحة التي يقرؤها الموديل
 MAX_IMG_PAGES = 3                # أقصى صفحات تُرسل كصور في الكتب الكبيرة
 SMALL_DOC = 8                    # ملف بهذا الحجم أو أقل: يقرأ الموديل كل صفحاته مباشرة
@@ -716,22 +718,26 @@ TAIL = ("قواعد الإجابة:\n"
         "بعد الإجابة أضف الأسطر التالية بالضبط، كل واحد في سطر مستقل:\n")
 
 
-def text_instructions(query):
-    return (f"أنت معلم خبير ودقيق في المناهج الدراسية. سؤال الطالب: '{query}'.\n"
+def _ref_block(ref):
+    return (f"مرجع من بحث الإنترنت (للاسترشاد والتحقق فقط، والأولوية لما هو مكتوب في الكتاب): {ref}\n" if ref else "")
+
+
+def text_instructions(query, ref=""):
+    return (f"أنت معلم خبير ودقيق في المناهج الدراسية. سؤال الطالب: '{query}'.\n" + _ref_block(ref) +
             "المرفق نصوص صفحات من الكتاب، وكل صفحة بعنوان يبيّن رقمها.\n" + TAIL +
             "PAGE: رقم الصفحة كما في عنوانها (أو 0 إذا لم تجد الإجابة في الصفحات)\n"
             "PRINTED_PAGE: الرقم المطبوع على الصفحة إن ظهر في نصها، وإلا 0\n"
             "EXACT_TEXT: الجملة القصيرة (حتى 25 كلمة) من الكتاب التي تحتوي الإجابة، منسوخة حرفياً من النص (اتركه فارغاً إذا PAGE: 0)")
 
 
-def image_instructions(query, provider):
+def image_instructions(query, provider, ref=""):
     if provider == "gemini":
         boxes = ("BOXES: مصفوفة JSON من المستطيلات [ymin,xmin,ymax,xmax] بإحداثيات من 0 إلى 1000 على صورة تلك الصفحة، "
                  "مستطيل لكل سطر من سطور الجملة التي فيها الإجابة، مثال: [[300,150,330,700]]. إذا لم تجد اكتب []\n")
     else:
         boxes = ("BOXES: مصفوفة JSON من المستطيلات [x0,y0,x1,y1] بالبكسل على صورة تلك الصفحة (0,0 أعلى اليسار)، "
                  "مستطيل لكل سطر من سطور الجملة التي فيها الإجابة، مثال: [[80,300,500,324]]. إذا لم تجد اكتب []\n")
-    return (f"أنت معلم خبير ودقيق في المناهج الدراسية. سؤال الطالب: '{query}'.\n"
+    return (f"أنت معلم خبير ودقيق في المناهج الدراسية. سؤال الطالب: '{query}'.\n" + _ref_block(ref) +
             "المرفق صفحات من الكتاب (صور أو نصوص)، وكل صفحة بعنوان يبيّن رقمها.\n" + TAIL +
             "PAGE: رقم الصفحة المرفقة كما في عنوانها (أو 0)\n"
             "PRINTED_PAGE: الرقم المطبوع على الصفحة نفسها (غالباً أسفلها) أو 0\n" + boxes +
@@ -872,6 +878,117 @@ def local_fallback(doc, pi, toks):
             "detail": " | ".join(LAST_AI_ERRORS[-2:]) or None, "_cache": False}
 
 
+_WEB_POOL = ThreadPoolExecutor(max_workers=4)
+_WEB_CACHE = OrderedDict()
+AI_STATUS = {"selftest": [], "at": None}
+WEB_PROMPT = ("أنت باحث تعليمي. ابحث في الإنترنت (في مصادر موثوقة) عن الإجابة الدقيقة لسؤال طالب في المنهج السعودي، "
+              "ثم أجب بهذا الشكل بالضبط:\n"
+              "ANSWER: الإجابة الدقيقة بالعربية في جملتين إلى أربع جمل\n"
+              "TERMS: من 8 إلى 12 مصطلحاً وعبارة بالعربية الفصحى كما قد تظهر في نص الكتاب المدرسي، مفصولة بفواصل\n"
+              "سؤال الطالب: ")
+
+
+def _think_cfg(model):
+    return (types.ThinkingConfig(thinking_budget=0) if model.startswith("gemini-2.5")
+            else types.ThinkingConfig(thinking_level="low"))
+
+
+def _web_gemini(query):
+    m = GEMINI_MODELS[0]
+    r = gemini_client.models.generate_content(
+        model=m, contents=WEB_PROMPT + query,
+        config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())],
+                                           thinking_config=_think_cfg(m), max_output_tokens=600, temperature=0.1))
+    return (r.text or "").strip()
+
+
+def _web_claude(query):
+    r = client.messages.create(model=CLAUDE_MODEL, max_tokens=800,
+                               tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}],
+                               messages=[{"role": "user", "content": WEB_PROMPT + query}])
+    return "".join(b.text for b in r.content if getattr(b, "type", "") == "text").strip()
+
+
+def web_reference(query):
+    """يبحث في الإنترنت عن الإجابة الصحيحة ويرجع (الإجابة، مصطلحات تُستعمل للبحث داخل الكتاب)."""
+    if not WEB_SEARCH:
+        return "", []
+    ck = " ".join(query_tokens(query)) or norm(query)
+    if ck in _WEB_CACHE:
+        return _WEB_CACHE[ck]
+    fns = []
+    if gemini_client and GEMINI_MODELS:
+        fns.append(_web_gemini)
+    if client:
+        fns.append(_web_claude)
+    for fn in fns:
+        try:
+            raw = fn(query)
+            a = re.search(r"ANSWER\s*:\s*(.+?)(?=\n\s*TERMS\s*:|$)", raw, re.S)
+            t = re.search(r"TERMS\s*:\s*(.+)$", raw, re.S)
+            ans = (a.group(1).strip() if a else raw.strip())[:900]
+            terms = [x.strip() for x in re.split(r"[،,\n]", t.group(1))] if t else []
+            terms = [x for x in terms if x][:14]
+            if ans:
+                _WEB_CACHE[ck] = (ans, terms)
+                while len(_WEB_CACHE) > 80:
+                    _WEB_CACHE.popitem(last=False)
+                return ans, terms
+        except Exception as e:
+            print(f"[WEB] {fn.__name__}: {type(e).__name__}: {str(e)[:200]}")
+            _note_ai_error("web", fn.__name__, e)
+    return "", []
+
+
+def run_ai_selftest():
+    """يجرّب كل موديل (وبحث الإنترنت) بطلب صغير ويخزّن النتيجة؛ تظهر في /api/ai-status وفي سجل Render."""
+    pages = [{"label": "[اختبار]", "text": "اكتب كلمة واحدة فقط: تم"}]
+    jobs = []
+    if client:
+        jobs += [("claude", m) for m in [CLAUDE_MODEL] + CLAUDE_FALLBACKS]
+    if gemini_client:
+        jobs += [("gemini", m) for m in GEMINI_MODELS]
+    if WEB_SEARCH and gemini_client and GEMINI_MODELS:
+        jobs.append(("web-gemini", GEMINI_MODELS[0]))
+    if WEB_SEARCH and client:
+        jobs.append(("web-claude", CLAUDE_MODEL))
+
+    def one(job):
+        provider, model = job
+        t0 = time.time()
+        try:
+            if provider == "claude":
+                out = call_claude(pages, "أجب بكلمة واحدة.", 30, model)
+            elif provider == "gemini":
+                out = call_gemini(model, pages, "أجب بكلمة واحدة.", 30)
+            elif provider == "web-gemini":
+                out = _web_gemini("ما عاصمة المملكة العربية السعودية؟")
+            else:
+                out = _web_claude("ما عاصمة المملكة العربية السعودية؟")
+            return {"provider": provider, "model": model, "ok": bool(out), "ms": int((time.time() - t0) * 1000),
+                    "error": "" if out else "رد فارغ"}
+        except Exception as e:
+            return {"provider": provider, "model": model, "ok": False, "ms": int((time.time() - t0) * 1000),
+                    "error": f"{type(e).__name__}: {str(e)[:220]}"}
+    if not jobs:
+        AI_STATUS["selftest"], AI_STATUS["at"] = [], time.strftime("%Y-%m-%d %H:%M:%S")
+        return []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        res = list(ex.map(one, jobs))
+    AI_STATUS["selftest"], AI_STATUS["at"] = res, time.strftime("%Y-%m-%d %H:%M:%S")
+    for r in res:
+        print("[AI-SELFTEST]", r)
+    return res
+
+
+def rrf(lists, k=3):
+    sc = {}
+    for lst in lists:
+        for r, p in enumerate(lst):
+            sc[p] = sc.get(p, 0) + 1.0 / (k + r)
+    return [p for p, _ in sorted(sc.items(), key=lambda x: -x[1])]
+
+
 def expand_query(query):
     """إذا لم تُوجد كلمات السؤال في الكتاب (لهجة عامية أو مرادفات) نطلب من الموديل كلمات فصيحة مرادفة."""
     try:
@@ -889,21 +1006,35 @@ def answer_question(path, key, query):
     idx = get_index(path, key)
     n_pages = len(idx.norm)
     small = n_pages <= SMALL_DOC        # ملف صغير (حتى صفحة واحدة): الموديل يقرأ كل صفحاته مباشرة
+    fut = _WEB_POOL.submit(web_reference, query) if (WEB_SEARCH and not small) else None
     if not small:
         ensure_ocr(path, key, idx, wait=25)
     pct = 100 if small else idx.pct()
     note = None if pct >= 100 else f"جاري تجهيز الكتاب (تمت قراءة {pct}% من صفحاته). أعد السؤال بعد قليل لنتيجة أدق."
-    toks = query_tokens(query)
+    ref, terms = "", []
+    if fut is not None:
+        try:
+            ref, terms = fut.result(timeout=WEB_TIMEOUT)
+        except Exception:
+            ref, terms = "", []
+    toks = query_tokens(query + " " + " ".join(terms))
     if small:
         cands = list(range(n_pages))
     else:
         cands, best = rank_pages(idx.norm, query, top_n=CAND_PAGES)
-        if not cands:
+        if terms:
+            tc, tb = rank_pages(idx.norm, " ".join(terms), top_n=CAND_PAGES)
+            cands, best = rrf([cands, tc])[:CAND_PAGES], max(best, tb)
+        elif not cands:
             extra = expand_query(query)
             if extra:
                 cands, best = rank_pages(idx.norm, query + " " + extra, top_n=CAND_PAGES)
                 toks = query_tokens(query + " " + extra)
         if not cands or best <= 0:
+            if ref:
+                return {"page_number": None, "pdf_page": None, "highlight": "", "page_image": None, "note": note,
+                        "answer": ref + "\n\n(هذه الإجابة من بحث الإنترنت، ولم أجد هذا الموضوع في الكتاب.)",
+                        "verified": True, "_cache": False}
             return {"page_number": None, "pdf_page": None, "answer": NO_MATCH, "highlight": "",
                     "page_image": None, "note": note, "_cache": False}
         nxt = cands[0] + 1                # الصفحة التالية للأقرب غالباً فيها التتمة
@@ -926,7 +1057,7 @@ def answer_question(path, key, query):
                 pages.append({"label": f"صفحة رقم {i + 1} (أبعاد الصورة: {pw}x{ph} بكسل):", "jpeg": jpg})
                 used.append(i)
                 imgs += 1
-        make = (lambda p: image_instructions(query, p)) if dims else (lambda p: text_instructions(query))
+        make = (lambda p: image_instructions(query, p, ref)) if dims else (lambda p: text_instructions(query, ref))
         try:
             raw, provider = run_models(pages, make, max_tokens=650 if dims else 500)
         except AIUnavailable:
@@ -951,7 +1082,8 @@ def answer_question(path, key, query):
                 rects.append(fitz.Rect(min(b[0], b[2]) * k, min(b[1], b[3]) * k, max(b[0], b[2]) * k, max(b[1], b[3]) * k))
         return {"page_number": printed if printed else page_idx + 1, "pdf_page": page_idx + 1,
                 "answer": answer or "لم يتم العثور على إجابة واضحة.", "highlight": highlight,
-                "page_image": render_page(doc, page_idx, rects), "note": note, "_cache": pct >= 100}
+                "page_image": render_page(doc, page_idx, rects), "note": note, "verified": bool(ref),
+                "_cache": pct >= 100}
     finally:
         doc.close()
 
@@ -1045,6 +1177,7 @@ def _startup():
                 p = os.path.join(BOOKS_DIR, fn)
                 warm(p, book_key(p))
     threading.Thread(target=run, daemon=True).start()
+    threading.Thread(target=run_ai_selftest, daemon=True).start()
 
 
 # ═════════════════════════ واجهات API ═════════════════════════
@@ -1244,6 +1377,19 @@ def admin_catalog(request: Request, key: str = Form(...), group: str = Form(...)
         _write_json("catalog.json", ov)
         return {"ok": True, "count": len(rows)}
     return respond(go)
+
+
+@app.get("/api/ai-status")
+def ai_status(request: Request, run: int = 0):
+    """افتحها في المتصفح: تعرض هل المفاتيح مضبوطة ونتيجة تجربة كل موديل وسبب الفشل. أضف ?run=1 لإعادة التجربة."""
+    if run:
+        if not rate_ok(request, "aitest", 3):
+            return too_many()
+        run_ai_selftest()
+    return {"anthropic_key": bool(ANTHROPIC_API_KEY), "gemini_key": bool(GEMINI_API_KEY),
+            "claude_model": CLAUDE_MODEL, "claude_fallbacks": CLAUDE_FALLBACKS, "gemini_models": GEMINI_MODELS,
+            "web_search": WEB_SEARCH, "tested_at": AI_STATUS["at"], "selftest": AI_STATUS["selftest"],
+            "recent_errors": LAST_AI_ERRORS[-6:]}
 
 
 @app.post("/api/admin/ai-test")
@@ -1470,6 +1616,23 @@ display:flex;padding:6px;gap:4px;background:rgba(6,41,31,.82);backdrop-filter:bl
 .shero::before{opacity:.45}
 .top h1{font-size:1.3rem}
 .res blockquote{white-space:pre-line}
+/* تخفيف الزخارف والخطوط */
+.k,.cover b,.stat b,.med b,.stage .n,.top h1,.hero h2,.shero h2,h2.h,.crumbs span{font-family:'IBM Plex Sans Arabic',system-ui,sans-serif!important;letter-spacing:0}
+.k,h2.h,.hero h2,.shero h2,.stage b,.cover b,.top h1{font-weight:700}
+.top::before,.hero::before,.arch,.stage::before,.cover::after,.shero::before,.row.ai::after,.top h1::before{display:none!important}
+.top h1{background:none;-webkit-text-fill-color:var(--gold-l);color:var(--gold-l);font-size:1.2rem}
+.hero h2{background:none;-webkit-text-fill-color:var(--gold-l);color:var(--gold-l);font-size:2rem}
+.hero{box-shadow:0 18px 32px -22px var(--sh);border:1px solid rgba(212,175,90,.35);background:linear-gradient(145deg,#06291f,#0e5a44)}
+.stage{background:linear-gradient(135deg,var(--c),color-mix(in srgb,var(--c) 55%,#000))}
+.cover{background:linear-gradient(150deg,var(--c),color-mix(in srgb,var(--c) 50%,#000))}
+.shero{background:linear-gradient(145deg,var(--c),color-mix(in srgb,var(--c) 50%,#000))}
+.top::after,.stage::after,.shero::after,.cover::before{opacity:.3;height:5px;background-size:12px 6px}
+.sec::after{background:linear-gradient(90deg,var(--gold),transparent);height:2px;opacity:.5}
+.archc{box-shadow:0 10px 20px -16px var(--sh);border-radius:52px 52px 18px 18px}
+.stage .n{-webkit-text-stroke:0;color:var(--gold-l);text-shadow:none;font-size:2.8rem}
+.cover .em,.shero .em{box-shadow:none;border-radius:50%}
+.vchip{margin:0 0 10px;font-size:.82rem;font-weight:600;color:var(--emerald)}
+.res .hint[dir=ltr]{font-size:.72rem;opacity:.8;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
@@ -1494,7 +1657,7 @@ solved:'الكتاب محلول',solvedHint:'الكتاب مع الحلول',vid
 soon:'قريباً',notAvail:'ملف هذا الكتاب لم يُضف بعد',qLabel:'اكتب سؤالك',qPh:'مثال: ما هو قانون كبلر الأول؟',
 search:'ابحث في الكتاب',page:'الصفحة',pdfPage:'ترتيبها في الملف',fromBook:'من نص الكتاب',pageCap:'اضغط على الصفحة لتكبيرها',retry:'أعد المحاولة',close:'إغلاق',
 l1:'أبحث في صفحات الكتاب…',l2:'أقرأ الصفحات الأقرب لسؤالك…',l3:'أجهّز الإجابة…',l4:'الكتاب كبير، أجهّز صفحاته لأول مرة…',
-errServer:'تعذّر الاتصال بالخادم. أعد المحاولة بعد لحظات.',errSlow:'استغرق الرد وقتاً طويلاً. أعد المحاولة.',errNet:'تحقق من اتصالك بالإنترنت ثم أعد المحاولة.',aiThinking:'الذكاء الاصطناعي يصيغ لك الإجابة…',aiFail:'تعذّر توليد الإجابة الآن، وهذه أقرب فقرة في الكتاب لسؤالك.'},
+errServer:'تعذّر الاتصال بالخادم. أعد المحاولة بعد لحظات.',errSlow:'استغرق الرد وقتاً طويلاً. أعد المحاولة.',errNet:'تحقق من اتصالك بالإنترنت ثم أعد المحاولة.',aiThinking:'الذكاء الاصطناعي يصيغ لك الإجابة…',aiFail:'تعذّر توليد الإجابة الآن، وهذه أقرب فقرة في الكتاب لسؤالك.',verified:'تم التحقق من الإجابة بالبحث في الإنترنت'},
 en:{title:'Smart Curriculum Platform',sub:'Ask your textbook and get the answer with the page number',
 heroT:'Ask your book<br>get the page',heroBtn:'Upload a book and ask',home:'Home',upload:'Upload',lang:'عربي',
 pickStage:'Choose your stage',pickYear:'Choose a grade',pickTerm:'Choose a semester',pickSubject:'Choose a subject',yearsN:'academic years',subjectsN:'subjects',
@@ -1506,7 +1669,7 @@ solved:'Solved book',solvedHint:'Textbook with solutions',videos:'Lesson videos'
 soon:'Soon',notAvail:'This book file has not been added yet',qLabel:'Type your question',qPh:'e.g. What is Kepler’s first law?',
 search:'Search the book',page:'Page',pdfPage:'File page',fromBook:'From the book',pageCap:'Tap the page to zoom',retry:'Try again',close:'Close',
 l1:'Searching the book pages…',l2:'Reading the closest pages…',l3:'Preparing the answer…',l4:'Big book, preparing its pages for the first time…',
-errServer:'Could not reach the server. Try again in a moment.',errSlow:'The reply took too long. Try again.',errNet:'Check your connection and try again.',aiThinking:'AI is writing your answer…',aiFail:'Could not generate the answer now; this is the closest passage in the book.'}};
+errServer:'Could not reach the server. Try again in a moment.',errSlow:'The reply took too long. Try again.',errNet:'Check your connection and try again.',aiThinking:'AI is writing your answer…',aiFail:'Could not generate the answer now; this is the closest passage in the book.',verified:'Verified with an internet search'}};
 
 const state={lang:'ar',cat:null,view:'home',stage:null,year:null,term:null,subject:null,custom:null,up:{mode:'idle'}};
 const ADMIN=new URLSearchParams(location.search).has('admin');
@@ -1650,14 +1813,15 @@ function loading(){
   clearInterval(timer);timer=setInterval(()=>{i=Math.min(i+1,m.length-1);const e=$('lm');if(e)e.textContent=m[i===2&&Math.random()<.5?3:i]},3000);
 }
 function showError(msg,retry,detail){
-  $('out').innerHTML=`<div class="err"><p>${esc(msg)}</p>${ADMIN&&detail?`<p dir="ltr" style="margin-top:8px;font-size:.75rem;opacity:.85;overflow-wrap:anywhere">${esc(detail)}</p>`:''}</div>`+(retry?`<button class="btn alt" onclick="lastRun()">${t('retry')}</button>`:'');
+  $('out').innerHTML=`<div class="err"><p>${esc(msg)}</p>${detail?`<p dir="ltr" style="margin-top:8px;font-size:.75rem;opacity:.85;overflow-wrap:anywhere">${esc(detail)}</p>`:''}</div>`+(retry?`<button class="btn alt" onclick="lastRun()">${t('retry')}</button>`:'');
 }
 function showResult(d,o){
   o=o||{};
   const same=d.pdf_page===d.page_number;
   $('out').innerHTML=`<div class="res"><div class="rtop">${d.page_number?`<div class="med"><small>${t('page')}</small><b>${esc(d.page_number)}</b></div>`:''}${same||!d.pdf_page||o.pending?'':`<span class="fp">${t('pdfPage')}: ${esc(d.pdf_page)}</span>`}</div>
    ${d.note?`<p class="note">${esc(d.note)}</p>`:''}
-   ${ADMIN&&d.detail?`<p dir="ltr" class="hint">${esc(d.detail)}</p>`:''}
+   ${d.detail?`<p dir="ltr" class="hint">${esc(d.detail)}</p>`:''}
+   ${d.verified?`<p class="vchip">✓ ${t('verified')}</p>`:''}
    ${o.pending?`<p class="aiwait"><span class="dot"></span>${t('aiThinking')}</p>`:''}
    ${d.answer?`<p class="atext">${esc(d.answer)}</p>`:''}
    ${d.highlight?`<blockquote><small>${t('fromBook')}</small>${esc(d.highlight)}</blockquote>`:''}

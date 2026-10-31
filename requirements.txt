@@ -1,7 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
+python-multipart
+pymupdf
 anthropic
 google-genai
-python-multipart
-PyMuPDF
-pydantic
+pillow
+pillow-heif

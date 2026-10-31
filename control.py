@@ -427,12 +427,10 @@ if(KEY)login();
 # ───────────── التركيب ─────────────
 def setup(app, ns):
     """ns = globals() الخاصة بـ main.py"""
-    global _db_path
-    M.clear()
-    M.update(ns)
+    global _db_path, M
+    M = ns   # مرجع حي لمساحة أسماء main.py (يُستدعى setup مبكراً قبل تعريف باقي الدوال)
     _db_path = os.path.join(M["BOOKS_DIR"], "analytics.db")
     _init()
-    ApiError = M["ApiError"]
 
     def err(msg, code=400):
         return JSONResponse(status_code=code, content={"error_ar": msg})
@@ -447,6 +445,13 @@ def setup(app, ns):
     @app.middleware("http")
     async def _track(request: Request, call_next):
         resp = await call_next(request)
+        try:
+            if request.method == "GET" and request.url.path == "/" and resp.status_code == 200:
+                body = b"".join([chunk async for chunk in resp.body_iterator])
+                hdrs = {k: v for k, v in resp.headers.items() if k.lower() not in ("content-length", "content-type")}
+                resp = HTMLResponse(inject(body.decode("utf-8")), status_code=200, headers=hdrs)
+        except Exception as e:
+            print("[control] inject failed:", type(e).__name__, str(e)[:120])
         try:
             p, m, ok = request.url.path, request.method, resp.status_code < 400
             qp = request.query_params
@@ -552,7 +557,7 @@ def setup(app, ns):
                 try:
                     M["_save_book"](up, code, kind)
                     res.append({"file": up.filename, "ok": True})
-                except ApiError as e:
+                except M["ApiError"] as e:
                     res.append({"file": up.filename, "ok": False, "error": e.msg})
             return {"results": res}
         return guard(request, go)

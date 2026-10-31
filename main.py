@@ -24,8 +24,8 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ═════════════════════════ الإعدادات ═════════════════════════
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip() or None
+GEMINI_API_KEY = (os.environ.get("GEMINI_API_KEY") or "").strip() or None
 
 client = (anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0, max_retries=0)
           if ANTHROPIC_API_KEY else None)
@@ -33,11 +33,12 @@ gemini_client = (genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOpt
                  if GEMINI_API_KEY else None)
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
-CLAUDE_FALLBACK = os.environ.get("CLAUDE_FALLBACK", "claude-sonnet-5-5")
+CLAUDE_FALLBACKS = [m.strip() for m in os.environ.get("CLAUDE_FALLBACK", "claude-sonnet-5-5,claude-sonnet-4-6").split(",")
+                    if m.strip() and m.strip() != CLAUDE_MODEL]
 GEMINI_MODELS = [m.strip() for m in
                  os.environ.get("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY")
+ADMIN_KEY = (os.environ.get("ADMIN_KEY") or "").strip() or None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # على Render ضع Persistent Disk واضبط BOOKS_DIR=/var/data/books حتى لا تضيع الكتب عند إعادة التشغيل
@@ -48,10 +49,13 @@ for _d in (BOOKS_DIR, CACHE_DIR, UPLOAD_DIR):
     os.makedirs(_d, exist_ok=True)
 
 MAX_UPLOAD = 500 * 1024 * 1024   # 500 ميجابايت
-ANALYSIS_DPI = 100
+ANALYSIS_DPI = 120
 OCR_DPI = 110
 DISPLAY_DPI = 110
-HEDGE_SECONDS = float(os.environ.get("HEDGE_SECONDS", "1.5"))              # إذا تأخر الموديل الأول أكثر من هذا يبدأ الثاني بالتوازي (أسرع نتيجة تفوز)
+HEDGE_SECONDS = float(os.environ.get("HEDGE_SECONDS", "4.0"))              # إذا تأخر الموديل الأول أكثر من هذا يبدأ الثاني بالتوازي (أسرع نتيجة تفوز)
+CAND_PAGES = 5                   # عدد الصفحات المرشحة التي يقرؤها الموديل
+MAX_IMG_PAGES = 3                # أقصى صفحات تُرسل كصور في الكتب الكبيرة
+SMALL_DOC = 8                    # ملف بهذا الحجم أو أقل: يقرأ الموديل كل صفحاته مباشرة
 TEXT_PAGES = 3                   # عدد الصفحات المرسلة للموديل في الكتب النصية
 IEN_URL = "https://ien.edu.sa"
 EIN_CHANNEL = "https://www.youtube.com/@dorosien"
@@ -63,14 +67,14 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "P
 
 
 class ApiError(Exception):
-    def __init__(self, msg, status=400, retry=False):
+    def __init__(self, msg, status=400, retry=False, detail=None):
         super().__init__(msg)
-        self.msg, self.status, self.retry = msg, status, retry
+        self.msg, self.status, self.retry, self.detail = msg, status, retry, detail
 
 
 class AIUnavailable(ApiError):
-    def __init__(self, msg, status=503, retry=True):
-        super().__init__(msg, status, retry)
+    def __init__(self, msg, status=503, retry=True, detail=None):
+        super().__init__(msg, status, retry, detail)
 
 
 # ═════════════════════════ حماية من الاستهلاك الزائد ═════════════════════════
@@ -292,8 +296,8 @@ def norm(s: str) -> str:
 
 
 _STOP = {norm(w) for w in
-         "ما ماذا ماهو ماهي من هو هي هل كيف لماذا متى اين في على عن الى ذلك هذا هذه الذي التي اذكر عرف وضح اشرح علل فسر عدد قانون".split()}
-# ملاحظة: كلمة "قانون" في قائمة الإيقاف لأنها شائعة جداً؛ الاسم بعدها (كبلر) هو الأهم للبحث.
+         ("ما ماذا ماهو ماهي من هو هي هل كيف لماذا ليش ليه متى اين وين في على عن الى ذلك هذا هذه الذي التي "
+          "ايش وش شو ايه اذكر عرف وضح اشرح علل فسر عدد لي لنا معنى").split()}
 
 
 def _stem(w):
@@ -313,6 +317,8 @@ def query_tokens(q: str):
         w = _stem(w)
         if len(w) >= 2 and w not in out:
             out.append(w)
+        if len(w) >= 5 and w[0] in "لبو" and w[1:] not in out:   # لكبلر -> كبلر
+            out.append(w[1:])
     return out
 
 
@@ -413,8 +419,7 @@ def _ocr_group(path, group):
     try:
         pages = []
         for i in group:
-            pix = d[i].get_pixmap(dpi=OCR_DPI)
-            pages.append({"label": f"=== PAGE {i + 1} ===", "jpeg": pix.tobytes("jpeg", jpg_quality=70)})
+            pages.append({"label": f"=== PAGE {i + 1} ===", "jpeg": render_jpeg(d[i], OCR_DPI, quality=70)[0]})
     finally:
         d.close()
     with _OCR_SEM:
@@ -461,28 +466,55 @@ def ensure_ocr(path, key, idx, wait=45):
         th.join(wait)
 
 
-def rank_pages(norm_pages, query, top_n=3):
+def _proximity(page_norm, toks):
+    comp = page_norm.replace(" ", "")
+    pos = []
+    for t in toks:
+        ps, start = [], 0
+        while len(ps) < 25:
+            j = comp.find(t, start)
+            if j < 0:
+                break
+            ps.append(j)
+            start = j + 1
+        if ps:
+            pos.append(ps)
+    bonus = 0.0
+    for x in range(len(pos)):
+        for y in range(x + 1, len(pos)):
+            d = min(abs(a - b) for a in pos[x] for b in pos[y])
+            bonus += 2.0 / (1 + d / 40.0)
+    return min(bonus, 5.0)
+
+
+def rank_pages(norm_pages, query, top_n=5):
     toks = query_tokens(query)
     if not toks:
         return [], 0.0
-    n = len(norm_pages)
-    df = {t: sum(1 for p in norm_pages if t in p) for t in toks}
+    comp = [p.replace(" ", "") for p in norm_pages]   # بعض كتب الوزارة فيها مسافات خاطئة داخل الكلمات
+    n = len(comp)
+    df = {t: sum(1 for p in comp if t in p) for t in toks}
     scored = []
-    for i, p in enumerate(norm_pages):
+    for i, p in enumerate(comp):
         if not p:
             continue
-        s = 0.0
+        sc, hit = 0.0, 0
         for t in toks:
             c = p.count(t)
             if c:
-                s += (1 + math.log(c)) * math.log(1 + n / (1 + df[t]))
+                hit += 1
+                sc += (1 + math.log(c)) * math.log(1 + n / (1 + df[t]))
+        if not hit:
+            continue
+        sc *= 0.5 + 0.5 * hit / len(toks)
         for a, b in zip(toks, toks[1:]):
-            if f"{a} {b}" in p:
-                s += 1.5
-        if s > 0:
-            scored.append((s, i))
+            if a + b in p or b + a in p:
+                sc += 1.5
+        sc /= (1 + len(p) / 6000.0) ** 0.3
+        scored.append((sc, i))
     scored.sort(reverse=True)
-    top = scored[:top_n]
+    rer = sorted(((sc + _proximity(norm_pages[i], toks), i) for sc, i in scored[:12]), reverse=True)
+    top = rer[:top_n]
     return [i for _, i in top], (top[0][0] if top else 0.0)
 
 
@@ -583,8 +615,8 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
         attempts.append(("claude", CLAUDE_MODEL))
     if gemini_client:
         attempts += [("gemini", m) for m in GEMINI_MODELS]
-    if client and CLAUDE_FALLBACK and CLAUDE_FALLBACK != CLAUDE_MODEL:
-        attempts.append(("claude", CLAUDE_FALLBACK))
+    if client:
+        attempts += [("claude", m) for m in CLAUDE_FALLBACKS]
     if prefer == "gemini":
         attempts.sort(key=lambda a: 0 if a[0] == "gemini" else 1)
     if not attempts:
@@ -629,7 +661,8 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
         ex.shutdown(wait=False)
     if result:
         return result
-    raise AIUnavailable("الذكاء الاصطناعي مشغول حالياً بسبب كثرة الطلبات. انتظر لحظات وأعد المحاولة.")
+    raise AIUnavailable("تعذّر الوصول للذكاء الاصطناعي الآن. أعد المحاولة بعد لحظات.",
+                        detail=" | ".join(LAST_AI_ERRORS[-3:]) or None)
 
 
 def parse_reply(raw, page_indices):
@@ -672,16 +705,23 @@ def to_pixel_boxes(boxes, provider, w, h):
     return out
 
 
-TAIL = ("اكتب الإجابة نصاً عادياً بدون Markdown: ابدأ بالجواب المباشر في جملة واحدة، ثم أضف شرحاً مختصراً (حتى أربع جمل). "
-        "إذا كان السؤال مسألة حسابية فاعرض خطوات الحل بإيجاز مع الناتج النهائي. "
-        "إذا لم تجد الإجابة في الصفحات فقل ذلك بصراحة ولا تخترع إجابة.\nبعد الإجابة أضف الأسطر التالية بالضبط، كل واحد في سطر مستقل:\n")
+TAIL = ("قواعد الإجابة:\n"
+        "1) اقرأ كل الصفحات المرفقة أولاً، واختر الصفحة التي فيها الإجابة الفعلية (تعريف أو نص قانون أو شرح أو حل). "
+        "تجاهل صفحات الأهداف والمفردات والفهارس إذا وُجد شرح أوضح في صفحة أخرى.\n"
+        "2) ابدأ بالجواب المباشر الدقيق في جملة أو جملتين، ثم أضف شرحاً مبسطاً كأنك معلم (حتى خمس جمل). "
+        "وإذا كان السؤال مسألة حسابية فاعرض خطوات الحل والناتج النهائي بوحدته.\n"
+        "3) التزم بنص الكتاب ومصطلحاته العلمية عند الاقتباس.\n"
+        "4) إذا لم تجد الإجابة في الصفحات المرفقة فاذكر ذلك في أول سطر، ثم أجب باختصار من معرفتك العامة مع عبارة (من خارج الكتاب)، واجعل PAGE: 0.\n"
+        "5) اكتب نصاً عادياً بدون Markdown وبالعربية الفصحى المبسطة.\n"
+        "بعد الإجابة أضف الأسطر التالية بالضبط، كل واحد في سطر مستقل:\n")
 
 
 def text_instructions(query):
-    return (f"أنت معلم خبير في المناهج الدراسية. اعتماداً على نصوص صفحات الكتاب المرفقة فقط أجب بالعربية عن السؤال: '{query}'.\n" + TAIL +
-            "PAGE: رقم الصفحة كما في عنوانها (أو 0 إذا لم تجد الإجابة)\n"
+    return (f"أنت معلم خبير ودقيق في المناهج الدراسية. سؤال الطالب: '{query}'.\n"
+            "المرفق نصوص صفحات من الكتاب، وكل صفحة بعنوان يبيّن رقمها.\n" + TAIL +
+            "PAGE: رقم الصفحة كما في عنوانها (أو 0 إذا لم تجد الإجابة في الصفحات)\n"
             "PRINTED_PAGE: الرقم المطبوع على الصفحة إن ظهر في نصها، وإلا 0\n"
-            "EXACT_TEXT: الجملة القصيرة (حتى 25 كلمة) من الكتاب التي تحتوي الإجابة، منسوخة حرفياً من النص")
+            "EXACT_TEXT: الجملة القصيرة (حتى 25 كلمة) من الكتاب التي تحتوي الإجابة، منسوخة حرفياً من النص (اتركه فارغاً إذا PAGE: 0)")
 
 
 def image_instructions(query, provider):
@@ -691,10 +731,29 @@ def image_instructions(query, provider):
     else:
         boxes = ("BOXES: مصفوفة JSON من المستطيلات [x0,y0,x1,y1] بالبكسل على صورة تلك الصفحة (0,0 أعلى اليسار)، "
                  "مستطيل لكل سطر من سطور الجملة التي فيها الإجابة، مثال: [[80,300,500,324]]. إذا لم تجد اكتب []\n")
-    return (f"أنت معلم خبير في المناهج الدراسية. اعتماداً على صور صفحات الكتاب المرفقة فقط أجب بالعربية عن السؤال: '{query}'.\n" + TAIL +
-            "PAGE: رقم الصفحة المرفقة كما في عنوان الصورة (أو 0)\n"
+    return (f"أنت معلم خبير ودقيق في المناهج الدراسية. سؤال الطالب: '{query}'.\n"
+            "المرفق صفحات من الكتاب (صور أو نصوص)، وكل صفحة بعنوان يبيّن رقمها.\n" + TAIL +
+            "PAGE: رقم الصفحة المرفقة كما في عنوانها (أو 0)\n"
             "PRINTED_PAGE: الرقم المطبوع على الصفحة نفسها (غالباً أسفلها) أو 0\n" + boxes +
-            "EXACT_TEXT: الجملة الدقيقة من الكتاب التي تحتوي الإجابة")
+            "EXACT_TEXT: الجملة الدقيقة من الكتاب التي تحتوي الإجابة (اتركه فارغاً إذا PAGE: 0)")
+
+
+def render_jpeg(page, dpi, max_side=1600, quality=75, max_bytes=3_500_000):
+    """يرسم الصفحة JPEG بحجم آمن للموديل (أقصى ضلع 1600 بكسل وأقل من 3.5MB).
+    الملفات المحوّلة من صور تكون صفحتها ضخمة، والموديل يرفض الصور الكبيرة."""
+    r = page.rect
+    side = max(r.width, r.height) or 1
+    z = min(dpi / 72.0, max_side / side)
+    q = quality
+    while True:
+        pix = page.get_pixmap(matrix=fitz.Matrix(z, z))
+        jpg = pix.tobytes("jpeg", jpg_quality=q)
+        if len(jpg) <= max_bytes or z < 0.2:
+            return jpg, pix.width, pix.height, z
+        if q > 50:
+            q -= 15
+        else:
+            z *= 0.75
 
 
 def render_page(doc, page_num, rects):
@@ -705,11 +764,51 @@ def render_page(doc, page_num, rects):
             continue
         r = r + (-1.5, -1.5, 1.5, 1.5)
         page.draw_rect(r, color=(0.78, 0.55, 0.05), fill=(1, 0.82, 0.2), fill_opacity=0.42, width=1, overlay=True)
-    pix = page.get_pixmap(dpi=DISPLAY_DPI)
-    return "data:image/jpeg;base64," + base64.b64encode(pix.tobytes("jpeg", jpg_quality=80)).decode()
+    jpg = render_jpeg(page, DISPLAY_DPI, max_side=1800, quality=80)[0]
+    return "data:image/jpeg;base64," + base64.b64encode(jpg).decode()
 
 
 NO_MATCH = "لم أجد في الكتاب كلمات قريبة من سؤالك. جرّب صياغة أخرى بكلمات تظهر في الدرس نفسه."
+
+
+_AR_LETTER = re.compile(r"[\u0621-\u064A]")
+
+
+def text_is_broken(text):
+    """بعض كتب الوزارة تحمل طبقة نص مقطّعة ("ا لقانو ن")؛ نكتشفها ونستعمل الصورة بدلاً منها."""
+    toks = (text or "").split()
+    if len(toks) < 15:
+        return False
+    single = sum(1 for w in toks if len(w) == 1 and _AR_LETTER.match(w))
+    return single / len(toks) > 0.12
+
+
+def llm_page_text(page, toks, limit=2400):
+    lines = [l.strip() for l in page.get_text("text").split("\n") if l.strip()]
+    full = "\n".join(lines)
+    if len(full) <= limit:
+        return full
+    comp = [norm(l).replace(" ", "") for l in lines]
+    sc = [sum(1 for t in toks if t in c) for c in comp]
+    center = max(range(len(lines)), key=lambda i: sc[i]) if any(sc) else 0
+    lo = hi = center
+    size = len(lines[center])
+    while True:
+        grew = False
+        if lo > 0 and size + len(lines[lo - 1]) <= limit:
+            lo -= 1
+            size += len(lines[lo])
+            grew = True
+        if hi < len(lines) - 1 and size + len(lines[hi + 1]) <= limit:
+            hi += 1
+            size += len(lines[hi])
+            grew = True
+        if not grew:
+            break
+    keep = lines[lo:hi + 1]
+    if hi < len(lines) - 2:
+        keep = keep + lines[-2:]       # آخر سطرين غالباً فيهما رقم الصفحة المطبوع
+    return "\n".join(keep)
 
 
 def _line_groups(page):
@@ -724,7 +823,7 @@ def local_snippet(page, toks, span=2):
     groups = _line_groups(page)
     if not groups or not toks:
         return "", []
-    texts = [norm(" ".join(w[4] for w in g)) for g in groups]
+    texts = [norm(" ".join(w[4] for w in g)).replace(" ", "") for g in groups]
     sc = [sum(1 for t in toks if t in tx) for tx in texts]
     best, bi = 0.0, -1
     for i in range(len(groups)):
@@ -745,7 +844,7 @@ def local_snippet(page, toks, span=2):
 
 
 def locate_local(path, key, query):
-    """بحث محلي فوري بدون ذكاء اصطناعي: رقم الصفحة + الفقرة + الصفحة مظلّلة."""
+    """بحث محلي فوري بدون ذكاء اصطناعي: رقم الصفحة المحتملة + تظليل (يُستبدل بإجابة الذكاء الاصطناعي)."""
     idx = get_index(path, key)
     cands, best = rank_pages(idx.norm, query, top_n=3)
     if not cands or best <= 0:
@@ -754,6 +853,8 @@ def locate_local(path, key, query):
     try:
         pi = cands[0]
         text, rects = local_snippet(doc[pi], query_tokens(query))
+        if text_is_broken(doc[pi].get_text("text")):
+            text = ""
         return {"found": True, "page_number": pi + 1, "pdf_page": pi + 1, "snippet": text,
                 "page_image": render_page(doc, pi, rects)}
     finally:
@@ -762,52 +863,79 @@ def locate_local(path, key, query):
 
 def local_fallback(doc, pi, toks):
     text, rects = local_snippet(doc[pi], toks)
-    return {"page_number": pi + 1, "pdf_page": pi + 1, "answer": text or NO_MATCH, "highlight": "",
-            "page_image": render_page(doc, pi, rects),
-            "note": "الذكاء الاصطناعي مشغول الآن، وهذه أقرب فقرة في الكتاب لسؤالك.", "_cache": False}
+    if text_is_broken(doc[pi].get_text("text")):
+        text = ""
+    return {"page_number": pi + 1, "pdf_page": pi + 1,
+            "answer": text or "هذه أقرب صفحة لسؤالك، وقد ظُلّل الجزء المحتمل فيها.",
+            "highlight": "", "page_image": render_page(doc, pi, rects),
+            "note": "الذكاء الاصطناعي لا يستجيب الآن، وهذه أقرب فقرة في الكتاب لسؤالك.",
+            "detail": " | ".join(LAST_AI_ERRORS[-2:]) or None, "_cache": False}
+
+
+def expand_query(query):
+    """إذا لم تُوجد كلمات السؤال في الكتاب (لهجة عامية أو مرادفات) نطلب من الموديل كلمات فصيحة مرادفة."""
+    try:
+        pages = [{"label": "[سؤال طالب]", "text": query}]
+        raw, _ = run_models(
+            pages, lambda p: ("هذا سؤال طالب عن كتاب مدرسي سعودي وقد يكون بلهجة عامية. اكتب من 6 إلى 10 كلمات مفتاحية فصيحة "
+                              "ومصطلحات علمية ومرادفات قد ترد في نص الدرس، مفصولة بمسافات فقط وبدون أي شرح."),
+            max_tokens=60, hedge=3.0)
+        return raw.strip()[:200]
+    except Exception:
+        return ""
 
 
 def answer_question(path, key, query):
     idx = get_index(path, key)
-    ensure_ocr(path, key, idx, wait=45)
-    pct = idx.pct()
-    note = None if pct >= 100 else f"جاري تجهيز الكتاب (تمت قراءة {pct}% من صفحاته). أعد السؤال بعد قليل لنتيجة أدق."
     n_pages = len(idx.norm)
-    cands, best = rank_pages(idx.norm, query, top_n=3)
-    # ملف ممسوح صغير (حتى 6 صفحات): نرسل صفحاته كصور مباشرة بدون انتظار OCR
-    tiny_scan = (not cands or best <= 0) and idx.needs_ocr() and 0 < n_pages <= 6
-    if tiny_scan:
-        cands, best, note = list(range(n_pages)), 1.0, None
-    if not cands or best <= 0:
-        return {"page_number": None, "pdf_page": None, "answer": NO_MATCH, "highlight": "",
-                "page_image": None, "note": note, "_cache": False}
-
+    small = n_pages <= SMALL_DOC        # ملف صغير (حتى صفحة واحدة): الموديل يقرأ كل صفحاته مباشرة
+    if not small:
+        ensure_ocr(path, key, idx, wait=25)
+    pct = 100 if small else idx.pct()
+    note = None if pct >= 100 else f"جاري تجهيز الكتاب (تمت قراءة {pct}% من صفحاته). أعد السؤال بعد قليل لنتيجة أدق."
     toks = query_tokens(query)
+    if small:
+        cands = list(range(n_pages))
+    else:
+        cands, best = rank_pages(idx.norm, query, top_n=CAND_PAGES)
+        if not cands:
+            extra = expand_query(query)
+            if extra:
+                cands, best = rank_pages(idx.norm, query + " " + extra, top_n=CAND_PAGES)
+                toks = query_tokens(query + " " + extra)
+        if not cands or best <= 0:
+            return {"page_number": None, "pdf_page": None, "answer": NO_MATCH, "highlight": "",
+                    "page_image": None, "note": note, "_cache": False}
+        nxt = cands[0] + 1                # الصفحة التالية للأقرب غالباً فيها التتمة
+        order = cands[:3] + ([nxt] if nxt < n_pages else []) + cands[3:]
+        cands = list(OrderedDict.fromkeys(order))[:CAND_PAGES]
+
     doc = fitz.open(path)
     try:
-        text_cands = [i for i in cands if i not in idx.ocr_done and idx.len[i] >= 120]
-        use_text = bool(text_cands) and cands[0] in text_cands and not tiny_scan
-        pages, dims = [], {}
+        pages, dims, used, imgs = [], {}, [], 0
+        limit = 3500 if small else 2400
+        for i in cands:
+            raw_text = doc[i].get_text("text")
+            as_text = (i not in idx.ocr_done) and len(raw_text.strip()) >= 120 and not text_is_broken(raw_text)
+            if as_text:
+                pages.append({"label": f"[صفحة رقم {i + 1}]", "text": llm_page_text(doc[i], toks, limit)})
+                used.append(i)
+            elif imgs < (SMALL_DOC if small else MAX_IMG_PAGES):
+                jpg, pw, ph, z = render_jpeg(doc[i], ANALYSIS_DPI)
+                dims[i] = (pw, ph, z)
+                pages.append({"label": f"صفحة رقم {i + 1} (أبعاد الصورة: {pw}x{ph} بكسل):", "jpeg": jpg})
+                used.append(i)
+                imgs += 1
+        make = (lambda p: image_instructions(query, p)) if dims else (lambda p: text_instructions(query))
         try:
-            if use_text:
-                cands = text_cands[:TEXT_PAGES]   # كتاب نصي: نص فقط (الأسرع)
-                for i in cands:
-                    pages.append({"label": f"[صفحة رقم {i + 1}]", "text": words_to_text(page_words(doc[i]), 2600)})
-                raw, provider = run_models(pages, lambda p: text_instructions(query), max_tokens=400)
-            else:
-                cands = cands[:n_pages] if tiny_scan else cands[:2]
-                for i in cands:
-                    pix = doc[i].get_pixmap(dpi=ANALYSIS_DPI)
-                    dims[i] = (pix.width, pix.height)
-                    pages.append({"label": f"صفحة رقم {i + 1} (أبعاد الصورة: {pix.width}x{pix.height} بكسل):",
-                                  "jpeg": pix.tobytes("jpeg", jpg_quality=75)})
-                raw, provider = run_models(pages, lambda p: image_instructions(query, p), max_tokens=450)
+            raw, provider = run_models(pages, make, max_tokens=650 if dims else 500)
         except AIUnavailable:
-            if use_text:
-                return local_fallback(doc, cands[0], toks)
+            pi = 0 if small else cands[0]
+            if doc[pi].get_text("text").strip():
+                return local_fallback(doc, pi, toks)
             raise
 
-        answer, page_idx, printed, boxes, highlight = parse_reply(raw, cands)
+        answer, page_idx, printed, boxes, highlight = parse_reply(raw, used)
         rects = []
         if highlight and page_idx not in dims:
             rects = locate_rects(doc[page_idx], highlight)
@@ -817,8 +945,8 @@ def answer_question(path, key, query):
                 except Exception:
                     rects = []
         if not rects and boxes and page_idx in dims:
-            k = 72.0 / ANALYSIS_DPI
-            w, h = dims[page_idx]
+            w, h, z = dims[page_idx]
+            k = 1.0 / z
             for b in to_pixel_boxes(boxes, provider, w, h):
                 rects.append(fitz.Rect(min(b[0], b[2]) * k, min(b[1], b[3]) * k, max(b[0], b[2]) * k, max(b[1], b[3]) * k))
         return {"page_number": printed if printed else page_idx + 1, "pdf_page": page_idx + 1,
@@ -848,7 +976,8 @@ def respond(fn):
     try:
         return fn()
     except ApiError as e:
-        return JSONResponse(status_code=e.status, content={"error": e.msg, "error_ar": e.msg, "retry": e.retry})
+        return JSONResponse(status_code=e.status, content={"error": e.msg, "error_ar": e.msg, "retry": e.retry,
+                                                           "detail": getattr(e, "detail", None)})
     except Exception as e:
         print(f"[ERROR] {type(e).__name__}: {e}")
         msg = "حدث خطأ غير متوقع أثناء المعالجة. حاول مرة أخرى."
@@ -891,7 +1020,8 @@ def warm(path, key):
     """يبني الفهرس ويبدأ OCR في الخلفية للكتب الممسوحة، فيكون الكتاب جاهزاً قبل أول سؤال."""
     try:
         idx = get_index(path, key)
-        ensure_ocr(path, key, idx, wait=0)
+        if len(idx.norm) > SMALL_DOC:
+            ensure_ocr(path, key, idx, wait=0)
     except Exception as e:
         print("[warm] failed:", e)
 
@@ -1125,8 +1255,7 @@ def admin_ai_test(request: Request, key: str = Form(...)):
         jobs = []
         if client:
             jobs.append(("claude", CLAUDE_MODEL))
-            if CLAUDE_FALLBACK and CLAUDE_FALLBACK != CLAUDE_MODEL:
-                jobs.append(("claude", CLAUDE_FALLBACK))
+            jobs += [("claude", m) for m in CLAUDE_FALLBACKS]
         if gemini_client:
             jobs += [("gemini", m) for m in GEMINI_MODELS]
         results = []
@@ -1520,14 +1649,15 @@ function loading(){
   $('out').innerHTML=`<div class="loading"><p id="lm">${m[0]}</p><div class="sk"></div><div class="sk"></div><div class="sk"></div><div class="sk img"></div></div>`;
   clearInterval(timer);timer=setInterval(()=>{i=Math.min(i+1,m.length-1);const e=$('lm');if(e)e.textContent=m[i===2&&Math.random()<.5?3:i]},3000);
 }
-function showError(msg,retry){
-  $('out').innerHTML=`<div class="err"><p>${esc(msg)}</p></div>`+(retry?`<button class="btn alt" onclick="lastRun()">${t('retry')}</button>`:'');
+function showError(msg,retry,detail){
+  $('out').innerHTML=`<div class="err"><p>${esc(msg)}</p>${ADMIN&&detail?`<p dir="ltr" style="margin-top:8px;font-size:.75rem;opacity:.85;overflow-wrap:anywhere">${esc(detail)}</p>`:''}</div>`+(retry?`<button class="btn alt" onclick="lastRun()">${t('retry')}</button>`:'');
 }
 function showResult(d,o){
   o=o||{};
   const same=d.pdf_page===d.page_number;
   $('out').innerHTML=`<div class="res"><div class="rtop">${d.page_number?`<div class="med"><small>${t('page')}</small><b>${esc(d.page_number)}</b></div>`:''}${same||!d.pdf_page||o.pending?'':`<span class="fp">${t('pdfPage')}: ${esc(d.pdf_page)}</span>`}</div>
    ${d.note?`<p class="note">${esc(d.note)}</p>`:''}
+   ${ADMIN&&d.detail?`<p dir="ltr" class="hint">${esc(d.detail)}</p>`:''}
    ${o.pending?`<p class="aiwait"><span class="dot"></span>${t('aiThinking')}</p>`:''}
    ${d.answer?`<p class="atext">${esc(d.answer)}</p>`:''}
    ${d.highlight?`<blockquote><small>${t('fromBook')}</small>${esc(d.highlight)}</blockquote>`:''}
@@ -1552,7 +1682,7 @@ async function runAsk(urlLocate,urlAsk){
     done=true;clearInterval(timer);
     if(r.ok)showResult(d,{noscroll:!!local});
     else if(local)showResult(localView(local,t('aiFail')),{noscroll:true});
-    else showError(d.error_ar||d.error||t('errServer'),d.retry!==false);
+    else showError(d.error_ar||d.error||t('errServer'),d.retry!==false,d.detail);
   }catch(e){
     if(my!==runId)return;
     done=true;clearInterval(timer);

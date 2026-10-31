@@ -3,6 +3,7 @@
 """
 import os
 import re
+import sys
 import json
 import shutil
 import sqlite3
@@ -179,7 +180,7 @@ def _sysinfo():
             "anthropic_key": bool(M["ANTHROPIC_API_KEY"]), "gemini_key": bool(M["GEMINI_API_KEY"]),
             "claude_model": M["CLAUDE_MODEL"], "claude_fallbacks": M["CLAUDE_FALLBACKS"], "gemini_models": M["GEMINI_MODELS"],
             "web_search": M["WEB_SEARCH"], "selftest": M["AI_STATUS"]["selftest"], "tested_at": M["AI_STATUS"]["at"],
-            "recent_errors": M["LAST_AI_ERRORS"][-6:]}
+            "recent_errors": M["LAST_AI_ERRORS"][-6:], "pruned": PRUNED}
 
 
 # ───────────── الإعلانات (تُحقن في صفحة الموقع بدون تعديل HTML_PAGE) ─────────────
@@ -413,24 +414,72 @@ async function sys(){const s=await api('/api/ctl/system');
   <div class="card"><h2>💾 التخزين</h2><p class="hint" dir="ltr">${esc(s.books_dir)}</p><p class="hint">استخدام القرص: ${mb(used)} من ${mb(s.disk_total)}. إذا لم يكن المجلد على Persistent Disk في Render فستضيع الكتب والإحصائيات عند إعادة التشغيل.</p></div>
   <div class="card"><h2>🤖 الذكاء الاصطناعي</h2>
    <p>${s.anthropic_key?'<span class="ok">✓</span>':'<span class="bad">✗</span>'} مفتاح Claude &nbsp; ${s.gemini_key?'<span class="ok">✓</span>':'<span class="bad">✗</span>'} مفتاح Gemini &nbsp; ${s.web_search?'<span class="ok">✓</span>':'<span class="bad">✗</span>'} بحث الإنترنت</p>
-   <p class="hint" dir="ltr">${esc(s.claude_model)} → ${esc(s.claude_fallbacks.join(', '))}<br>${esc(s.gemini_models.join(', '))}</p>
+   <p class="hint" dir="ltr">${esc(s.claude_model)} → ${esc(s.claude_fallbacks.join(', '))}<br>${esc(s.gemini_models.join(', '))}</p>${(s.pruned||[]).length?`<p class="hint">استُبعدت تلقائياً (حصتها منتهية): <bdi dir="ltr">${esc(s.pruned.join(', '))}</bdi></p>`:''}
+   <label class="l">موديلات Gemini المستخدمة (مفصولة بفواصل، الفارغ = تلقائي بعد إعادة التشغيل)</label><input id="gm" dir="ltr" value="${esc(s.gemini_models.join(', '))}"><button class="btn s full" onclick="saveGm()">حفظ الموديلات</button>
    <button class="btn full" onclick="aiTest(this)">فحص كل الموديلات الآن</button><div id="aires">${aiRows(s.selftest)}${s.tested_at?`<p class="hint">آخر فحص: ${esc(s.tested_at)}</p>`:''}</div>
    ${s.recent_errors.length?`<details><summary>آخر الأخطاء</summary><p class="hint bad" dir="ltr">${s.recent_errors.map(esc).join('<br>')}</p></details>`:''}</div>
   <div class="card"><h2>🔗 روابط مفيدة</h2><p><a href="/" target="_blank">الموقع</a> · <a href="/privacy" target="_blank">الخصوصية</a> · <a href="/ads.txt" target="_blank">ads.txt</a> · <a href="/api/missing" target="_blank">الكتب الناقصة</a></p></div>
   <button class="btn alt full" onclick="logout()">تسجيل الخروج</button>`}
+async function saveGm(){try{await post('/api/ctl/gemini-models',{models:$('gm').value});toast('تم الحفظ');show('sys')}catch(e){toast(e.message,1)}}
 const aiRows=a=>(a||[]).map(x=>`<div class="${x.ok?'ok':'bad'}" dir="ltr" style="font-size:.82rem">${esc(x.provider)} / ${esc(x.model)}: ${x.ok?'OK ('+x.ms+' ms)':'ERROR '+esc(x.error)}</div>`).join('');
 async function aiTest(b){b.disabled=true;b.textContent='جاري الفحص...';try{const d=await api('/api/ctl/ai-test',{method:'POST'});$('aires').innerHTML=aiRows(d.results)||'<p class="bad">لا يوجد أي مفتاح مضبوط.</p>'}catch(e){toast(e.message,1)}b.disabled=false;b.textContent='فحص كل الموديلات الآن'}
 if(KEY)login();
 </script></body></html>"""
 
 
+# ───────────── استبعاد موديلات Gemini التي نفدت حصتها ─────────────
+PRUNED = []
+DEFAULT_GEMINI = "gemini-3.5-flash-lite"   # الموديل الذي نجح في فحص مفتاحك؛ غيّره من لوحة التحكم (تبويب النظام)
+
+
+def _apply_gemini_models():
+    """يثبّت قائمة موديلات Gemini قبل فحص الموديلات عند التشغيل، فلا تظهر أخطاء الحصة المنتهية في السجل."""
+    try:
+        if (os.environ.get("GEMINI_MODELS") or "").strip():
+            return                                   # متغير Render له الأولوية
+        saved = get_set("gemini_models", None)
+        lst = DEFAULT_GEMINI if saved is None else saved
+        lst = [m.strip() for m in lst.split(",") if m.strip()]
+        if lst:
+            M["GEMINI_MODELS"][:] = lst
+            M["GEMINI_MODELS_FROM_ENV"] = True       # يمنع الاكتشاف التلقائي من إعادة الموديلات المعطّلة
+    except Exception as e:
+        print("[control] gemini models:", type(e).__name__, str(e)[:120])
+
+
+def _prune_gemini(wait_s=240):
+    """بعد فحص الموديلات عند التشغيل: نُبقي الموديلات التي نجحت ونستبعد التي رجعت 429 (حصة منتهية)،
+    حتى لا يضيع الموقع وقتاً في موديلات لن تعمل ولا تمتلئ السجلات بالأخطاء."""
+    for _ in range(wait_s // 2):
+        time.sleep(2)
+        try:
+            st = M.get("AI_STATUS") or {}
+            if not st.get("at"):
+                continue
+            res = [r for r in st.get("selftest", []) if r.get("provider") == "gemini"]
+            ok = [r["model"] for r in res if r.get("ok")]
+            bad = [r["model"] for r in res if not r.get("ok") and "429" in (r.get("error") or "")]
+            if ok and bad:
+                M["GEMINI_MODELS"][:] = [m for m in M["GEMINI_MODELS"] if m not in bad]
+                PRUNED[:] = bad
+                print("[control] dropped gemini models with exhausted quota:", bad)
+        except Exception as e:
+            print("[control] prune failed:", type(e).__name__, str(e)[:120])
+        return
+
+
 # ───────────── التركيب ─────────────
 def setup(app, ns):
     """ns = globals() الخاصة بـ main.py"""
     global _db_path, M
+    if getattr(app, "_ctl_done", False):
+        return
+    app._ctl_done = True
     M = ns   # مرجع حي لمساحة أسماء main.py (يُستدعى setup مبكراً قبل تعريف باقي الدوال)
     _db_path = os.path.join(M["BOOKS_DIR"], "analytics.db")
     _init()
+    _apply_gemini_models()
+    threading.Thread(target=_prune_gemini, daemon=True).start()
 
     def err(msg, code=400):
         return JSONResponse(status_code=code, content={"error_ar": msg})
@@ -638,6 +687,19 @@ def setup(app, ns):
             return {"ok": True, "deleted": len(ids)}
         return guard(request, go)
 
+    @app.post("/api/ctl/gemini-models")
+    def ctl_gemini_models(request: Request, models: str = Form("")):
+        def go():
+            lst = [m.strip() for m in models.split(",") if m.strip()]
+            if any(not re.fullmatch(r"[A-Za-z0-9._\-]+", m) for m in lst):
+                return err("اسم موديل غير صحيح.")
+            put_set("gemini_models", ",".join(lst))
+            if lst:
+                M["GEMINI_MODELS"][:] = lst
+                M["GEMINI_MODELS_FROM_ENV"] = True
+            return {"ok": True}
+        return guard(request, go)
+
     @app.get("/api/ctl/system")
     def ctl_system(request: Request):
         return guard(request, _sysinfo)
@@ -645,3 +707,28 @@ def setup(app, ns):
     @app.post("/api/ctl/ai-test")
     def ctl_ai_test(request: Request):
         return guard(request, lambda: {"results": M["run_ai_selftest"]()})
+
+
+# ───────────── التركيب التلقائي ─────────────
+# يكفي سطر واحد في أول main.py:  import control
+# عند إنشاء app = FastAPI(...) يلتقطه هذا الملف ويركّب اللوحة والإحصائيات والإعلانات تلقائياً.
+def _install_hook():
+    import fastapi
+    if getattr(fastapi.FastAPI, "_ctl_patched", False):
+        return
+    orig = fastapi.FastAPI.__init__
+
+    def hooked(self, *a, **k):
+        orig(self, *a, **k)
+        try:
+            ns = sys._getframe(1).f_globals          # مساحة أسماء الملف الذي أنشأ التطبيق (main.py)
+            if "BOOKS_DIR" in ns and "ANTHROPIC_API_KEY" in ns:
+                setup(self, ns)
+        except Exception as e:
+            print("[control] attach failed:", type(e).__name__, str(e)[:200])
+
+    fastapi.FastAPI.__init__ = hooked
+    fastapi.FastAPI._ctl_patched = True
+
+
+_install_hook()

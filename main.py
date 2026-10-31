@@ -1,4 +1,7 @@
-import control
+try:
+    import control
+except ImportError:
+    pass
 import io
 import os
 import re
@@ -1362,6 +1365,20 @@ def discover_gemini_models():
         print("[gemini] discovery failed:", type(e).__name__, str(e)[:160])
 
 
+def _keep_alive():
+    """يرسل طلباً لنفسه كل 10 دقائق حتى لا تطفئه Render بعد 15 دقيقة بدون زوار."""
+    import urllib.request
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url or os.environ.get("KEEP_ALIVE", "1") != "1":
+        return
+    while True:
+        time.sleep(600)
+        try:
+            urllib.request.urlopen(url + "/healthz", timeout=20).read()
+        except Exception as e:
+            print("[keepalive]", type(e).__name__)
+
+
 def _boot_ai():
     discover_gemini_models()
     run_ai_selftest()
@@ -1376,9 +1393,15 @@ def _startup():
                 warm(p, book_key(p))
     threading.Thread(target=run, daemon=True).start()
     threading.Thread(target=_boot_ai, daemon=True).start()
+    threading.Thread(target=_keep_alive, daemon=True).start()
 
 
 # ═════════════════════════ واجهات API ═════════════════════════
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
 @app.get("/api/catalog")
 def api_catalog():
     return build_catalog()

@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import json
@@ -36,7 +37,8 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-5-5")
 CLAUDE_FALLBACKS = [m.strip() for m in os.environ.get("CLAUDE_FALLBACK", "claude-sonnet-5-5,claude-sonnet-4-6").split(",")
                     if m.strip() and m.strip() != CLAUDE_MODEL]
 GEMINI_MODELS = [m.strip() for m in
-                 os.environ.get("GEMINI_MODELS", "gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
+                 os.environ.get("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.6-flash,gemini-3.1-pro-preview").split(",") if m.strip()]
+GEMINI_MODELS_FROM_ENV = bool((os.environ.get("GEMINI_MODELS") or "").strip())
 
 ADMIN_KEY = (os.environ.get("ADMIN_KEY") or "").strip() or None
 
@@ -593,12 +595,26 @@ def call_gemini(model, pages, instructions, max_tokens):
         contents.append(p["text"] if p.get("text") is not None
                         else types.Part.from_bytes(data=p["jpeg"], mime_type="image/jpeg"))
     contents.append(instructions)
-    think = (types.ThinkingConfig(thinking_budget=0) if model.startswith("gemini-2.5")
-             else types.ThinkingConfig(thinking_level="low"))
-    resp = gemini_client.models.generate_content(
-        model=model, contents=contents,
-        config=types.GenerateContentConfig(thinking_config=think, max_output_tokens=max_tokens, temperature=0.2))
-    return (resp.text or "").strip()
+    legacy = model.startswith("gemini-2")
+    # في سلسلة Gemini 3 يُحسب "التفكير" من حد المخرجات، فنزيد الحد حتى لا يُقطع الجواب
+    limit = max_tokens + (0 if legacy else 1500)
+
+    def go(think):
+        cfg = {"max_output_tokens": limit}
+        if legacy:
+            cfg["temperature"] = 0.2
+        if think is not None:
+            cfg["thinking_config"] = think
+        r = gemini_client.models.generate_content(model=model, contents=contents,
+                                                  config=types.GenerateContentConfig(**cfg))
+        return (r.text or "").strip()
+
+    try:
+        return go(_think_cfg(model))
+    except Exception as e:
+        if "think" in str(e).lower():       # بعض الموديلات لا تدعم إعداد التفكير
+            return go(None)
+        raise
 
 
 LAST_AI_ERRORS = []
@@ -625,6 +641,8 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
         raise AIUnavailable("لم يتم ضبط مفتاح: أضف ANTHROPIC_API_KEY أو GEMINI_API_KEY في إعدادات Render.",
                             status=500, retry=False)
 
+    errs = []
+
     def one(provider, model):
         instructions = make_instructions(provider)
         for i in range(2):
@@ -635,6 +653,7 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
             except Exception as e:
                 print(f"[AI] {provider}/{model} attempt {i + 1}: {type(e).__name__}: {str(e)[:200]}")
                 _note_ai_error(provider, model, e)
+                errs.append(f"{provider}/{model}: {type(e).__name__}: {str(e)[:140]}")
                 if i == 0 and _is_transient(e):
                     time.sleep(0.8)
                     continue
@@ -664,7 +683,7 @@ def run_models(pages, make_instructions, prefer=None, max_tokens=600, hedge=HEDG
     if result:
         return result
     raise AIUnavailable("تعذّر الوصول للذكاء الاصطناعي الآن. أعد المحاولة بعد لحظات.",
-                        detail=" | ".join(LAST_AI_ERRORS[-3:]) or None)
+                        detail=" | ".join(errs)[:900] or None)
 
 
 def parse_reply(raw, page_indices):
@@ -889,8 +908,9 @@ WEB_PROMPT = ("أنت باحث تعليمي. ابحث في الإنترنت (ف�
 
 
 def _think_cfg(model):
-    return (types.ThinkingConfig(thinking_budget=0) if model.startswith("gemini-2.5")
-            else types.ThinkingConfig(thinking_level="low"))
+    if model.startswith("gemini-2"):
+        return types.ThinkingConfig(thinking_budget=0)
+    return types.ThinkingConfig(thinking_level=os.environ.get("GEMINI_THINKING", "low"))
 
 
 def _web_gemini(query):
@@ -898,7 +918,7 @@ def _web_gemini(query):
     r = gemini_client.models.generate_content(
         model=m, contents=WEB_PROMPT + query,
         config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())],
-                                           thinking_config=_think_cfg(m), max_output_tokens=600, temperature=0.1))
+                                           thinking_config=_think_cfg(m), max_output_tokens=2000))
     return (r.text or "").strip()
 
 
@@ -1134,6 +1154,147 @@ def save_stream(up: UploadFile, dest_tmp: str, limit=MAX_UPLOAD):
     return h.hexdigest(), size
 
 
+_IMG_MAGIC = [(b"\x89PNG", "png"), (b"\xff\xd8", "jpg"), (b"GIF8", "gif"), (b"BM", "bmp"),
+              (b"II*\x00", "tiff"), (b"MM\x00*", "tiff")]
+_IMG_EXT = {"png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif", "avif"}
+
+
+def _fitz_convert(src, ext=None):
+    d = fitz.open(src, filetype=ext) if ext else fitz.open(src)
+    try:
+        return d.convert_to_pdf()
+    finally:
+        d.close()
+
+
+def _image_to_pdf_bytes(src, kind):
+    try:   # Pillow (اختياري) يعالج اتجاه صور الجوال وصيغ webp/heic
+        from PIL import Image, ImageOps
+        try:
+            from pillow_heif import register_heif_opener
+            register_heif_opener()
+        except Exception:
+            pass
+        im = ImageOps.exif_transpose(Image.open(src)).convert("RGB")
+        im.thumbnail((4000, 4000))
+        buf = io.BytesIO()
+        im.save(buf, "JPEG", quality=90)
+        d = fitz.open(stream=buf.getvalue(), filetype="jpeg")
+        try:
+            return d.convert_to_pdf()
+        finally:
+            d.close()
+    except Exception as e:
+        print("[convert] pillow path skipped:", type(e).__name__, str(e)[:100])
+    return _fitz_convert(src, {"jpg": "jpeg", "tif": "tiff"}.get(kind, kind))
+
+
+def _office_text(path):
+    """Word / PowerPoint / Excel -> نص عادي بدون مكتبات إضافية."""
+    import zipfile
+    import html as _html
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception:
+        return None
+    names = z.namelist()
+
+    def texts(xml, tag):
+        return "".join(re.findall(r"<%s(?: [^>]*)?>(.*?)</%s>" % (tag, tag), xml, re.S))
+    out = []
+    if "word/document.xml" in names:
+        xml = z.read("word/document.xml").decode("utf-8", "ignore")
+        for p in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+            t = texts(p, "w:t")
+            if t.strip():
+                out.append(_html.unescape(t))
+    elif any(re.match(r"ppt/slides/slide\d+\.xml$", n) for n in names):
+        slides = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                        key=lambda n: int(re.findall(r"\d+", n)[0]))
+        for i, n in enumerate(slides, 1):
+            out.append(f"--- شريحة {i} ---")
+            xml = z.read(n).decode("utf-8", "ignore")
+            for p in re.findall(r"<a:p>.*?</a:p>", xml, re.S):
+                t = texts(p, "a:t")
+                if t.strip():
+                    out.append(_html.unescape(t))
+    elif "xl/sharedStrings.xml" in names:
+        xml = z.read("xl/sharedStrings.xml").decode("utf-8", "ignore")
+        for si in re.findall(r"<si>.*?</si>", xml, re.S):
+            t = texts(si, "t")
+            if t.strip():
+                out.append(_html.unescape(t))
+    else:
+        return None
+    return "\n".join(out)
+
+
+def _decode_text(raw):
+    if b"\x00" in raw[:4096] and not raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        raise ApiError("نوع الملف غير مدعوم. ارفع PDF أو صورة أو Word أو PowerPoint أو Excel أو ملفاً نصياً.", 400)
+    for enc in ("utf-8-sig", "utf-16", "cp1256"):
+        try:
+            t = raw.decode(enc)
+            if "\x00" not in t:
+                return t
+        except Exception:
+            pass
+    return raw.decode("latin-1")
+
+
+def _text_to_pdf_bytes(text):
+    if not text.strip():
+        raise ApiError("الملف فارغ أو لا يحتوي نصاً يمكن قراءته.", 400)
+    if sum(1 for c in text[:5000] if ord(c) < 9 or 13 < ord(c) < 32) > 50:
+        raise ApiError("نوع الملف غير مدعوم. ارفع PDF أو صورة أو Word أو PowerPoint أو Excel أو ملفاً نصياً.", 400)
+    d = fitz.open(stream=text.encode("utf-8"), filetype="txt")
+    try:
+        return d.convert_to_pdf()
+    finally:
+        d.close()
+
+
+def to_pdf(src, name, dest):
+    """يحوّل أي ملف (PDF، صورة، Word، PowerPoint، Excel، نص، HTML، EPUB...) إلى PDF للقراءة والسؤال."""
+    with open(src, "rb") as f:
+        head = f.read(16)
+    ext = os.path.splitext(name or "")[1].lower().lstrip(".")
+    if head.startswith(b"%PDF"):
+        os.replace(src, dest)
+        return
+    kind = next((k for m, k in _IMG_MAGIC if head.startswith(m)), None)
+    if kind is None and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        kind = "webp"
+    if kind is None and head[4:8] == b"ftyp":
+        kind = "heic"
+    if kind is None and ext in _IMG_EXT:
+        kind = ext
+    pdf = None
+    try:
+        if kind:
+            pdf = _image_to_pdf_bytes(src, kind)
+        elif head[:2] == b"PK":
+            text = _office_text(src)
+            pdf = _text_to_pdf_bytes(text) if text is not None else _fitz_convert(src, ext or None)
+        elif ext in ("htm", "html", "xhtml", "svg", "epub", "xps", "oxps", "mobi", "fb2", "cbz"):
+            pdf = _fitz_convert(src, ext)
+        else:
+            with open(src, "rb") as f:
+                pdf = _text_to_pdf_bytes(_decode_text(f.read()))
+    except ApiError:
+        raise
+    except Exception as e:
+        print("[convert] failed:", type(e).__name__, str(e)[:160])
+    if not pdf:
+        raise ApiError("تعذّر قراءة هذا النوع من الملفات. جرّب PDF أو صورة أو Word أو ملفاً نصياً.", 400)
+    with open(dest, "wb") as f:
+        f.write(pdf)
+    try:
+        os.remove(src)
+    except Exception:
+        pass
+
+
 def check_pdf(path):
     try:
         d = fitz.open(path)
@@ -1169,6 +1330,42 @@ def cleanup_uploads(max_age=12 * 3600):
             pass
 
 
+def discover_gemini_models():
+    """يقرأ الموديلات المتاحة لمفتاحك فعلياً ويختار الأحدث، فلا يتعطل الموقع عند إغلاق موديل قديم."""
+    if not gemini_client or GEMINI_MODELS_FROM_ENV:
+        return
+    try:
+        found = []
+        for m in gemini_client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            acts = getattr(m, "supported_actions", None) or []
+            if not name.startswith("gemini-") or "generateContent" not in acts:
+                continue
+            if any(b in name for b in ("image", "tts", "live", "audio", "embed", "vision", "robot", "computer",
+                                       "omni", "gemma", "imagen", "veo", "aqa", "learnlm", "exp", "customtools")):
+                continue
+            v = re.match(r"gemini-(\d+(?:\.\d+)?)", name)
+            if not v:
+                continue
+            tier = "pro" if "-pro" in name else ("lite" if "lite" in name else ("flash" if "flash" in name else None))
+            if tier:
+                found.append((float(v.group(1)), "preview" not in name, name, tier))
+
+        def best(tier, n):
+            return [f[2] for f in sorted([f for f in found if f[3] == tier], reverse=True)[:n]]
+        chosen = best("flash", 2) + best("pro", 1) + best("lite", 1)
+        if chosen:
+            GEMINI_MODELS[:] = chosen
+            print("[gemini] models:", chosen)
+    except Exception as e:
+        print("[gemini] discovery failed:", type(e).__name__, str(e)[:160])
+
+
+def _boot_ai():
+    discover_gemini_models()
+    run_ai_selftest()
+
+
 @app.on_event("startup")
 def _startup():
     def run():
@@ -1177,7 +1374,7 @@ def _startup():
                 p = os.path.join(BOOKS_DIR, fn)
                 warm(p, book_key(p))
     threading.Thread(target=run, daemon=True).start()
-    threading.Thread(target=run_ai_selftest, daemon=True).start()
+    threading.Thread(target=_boot_ai, daemon=True).start()
 
 
 # ═════════════════════════ واجهات API ═════════════════════════
@@ -1224,8 +1421,6 @@ def custom_upload(request: Request, file: UploadFile = File(...)):
         return too_many()
 
     def go():
-        if not (file.filename or "").lower().endswith(".pdf"):
-            raise ApiError("يجب أن يكون الملف بصيغة PDF فقط.", 400)
         cleanup_uploads()
         tmp = os.path.join(UPLOAD_DIR, uuid.uuid4().hex + ".part")
         sha, size = save_stream(file, tmp)
@@ -1234,7 +1429,7 @@ def custom_upload(request: Request, file: UploadFile = File(...)):
             os.remove(tmp)
             os.utime(final, None)
         else:
-            os.replace(tmp, final)
+            to_pdf(tmp, file.filename, final)
         pages = check_pdf(final)
         threading.Thread(target=warm, args=(final, sha), daemon=True).start()
         return {"file_id": sha, "pages": pages, "size": size}
@@ -1649,8 +1844,8 @@ const T={
 ar:{title:'المنصة التعليمية الذكية للمناهج',sub:'اسأل كتابك المدرسي واحصل على الإجابة مع رقم الصفحة',
 heroT:'اسأل كتابك<br>يجيبك بالصفحة',heroBtn:'ارفع كتابك واسأل',home:'الرئيسية',upload:'ارفع كتابك',lang:'English',
 pickStage:'اختر مرحلتك',pickYear:'اختر الصف',pickTerm:'اختر الفصل الدراسي',pickSubject:'اختر المادة',yearsN:'سنوات دراسية',subjectsN:'مواد',
-customTitle:'ارفع كتابك الخاص',customSub:'أي ملف PDF حتى 500 ميجابايت. ارفعه مرة واحدة واسأل عنه بقدر ما تريد.',
-dropT:'اختر ملف PDF',dropS:'الحد الأعلى 500 ميجابايت',uploading:'جاري الرفع',ready:'الكتاب جاهز',pagesN:'صفحة',tooBig:'حجم الملف أكبر من 500 ميجابايت.',
+customTitle:'ارفع كتابك الخاص',customSub:'أي ملف (PDF، صورة، Word، PowerPoint، Excel، نص...) بأي حجم حتى 500 ميجابايت. ارفعه مرة واحدة واسأل عنه بقدر ما تريد.',
+dropT:'اختر ملفاً أو صورة',dropS:'الحد الأعلى 500 ميجابايت',uploading:'جاري الرفع',ready:'الكتاب جاهز',pagesN:'صفحة',tooBig:'حجم الملف أكبر من 500 ميجابايت.',
 ask:'اسأل الكتاب بالذكاء الاصطناعي',askHint:'إجابة سريعة مع رقم الصفحة وتظليل الجواب',
 book:'الكتاب (بدون حل)',bookHint:'افتح الكتاب PDF كاملاً',bookIen:'الكتاب من منصة عين',bookIenHint:'الملف لم يُضف بعد، افتح المصدر الرسمي',
 solved:'الكتاب محلول',solvedHint:'الكتاب مع الحلول',videos:'شرح الدروس',videosHint:'من قناة عين التعليمية على يوتيوب',
@@ -1661,8 +1856,8 @@ errServer:'تعذّر الاتصال بالخادم. أعد المحاولة ب�
 en:{title:'Smart Curriculum Platform',sub:'Ask your textbook and get the answer with the page number',
 heroT:'Ask your book<br>get the page',heroBtn:'Upload a book and ask',home:'Home',upload:'Upload',lang:'عربي',
 pickStage:'Choose your stage',pickYear:'Choose a grade',pickTerm:'Choose a semester',pickSubject:'Choose a subject',yearsN:'academic years',subjectsN:'subjects',
-customTitle:'Upload your own book',customSub:'Any PDF up to 500 MB. Upload once, ask as much as you like.',
-dropT:'Choose a PDF',dropS:'Up to 500 MB',uploading:'Uploading',ready:'Book ready',pagesN:'pages',tooBig:'File is larger than 500 MB.',
+customTitle:'Upload your own book',customSub:'Any file (PDF, image, Word, PowerPoint, Excel, text...) of any size up to 500 MB. Upload once, ask as much as you like.',
+dropT:'Choose a file or image',dropS:'Up to 500 MB',uploading:'Uploading',ready:'Book ready',pagesN:'pages',tooBig:'File is larger than 500 MB.',
 ask:'Ask the book with AI',askHint:'Quick answer with page number and highlight',
 book:'Textbook (without solutions)',bookHint:'Open the full PDF',bookIen:'Book on Ein platform',bookIenHint:'File not added yet, open the official source',
 solved:'Solved book',solvedHint:'Textbook with solutions',videos:'Lesson videos',videosHint:'From the Ein channel on YouTube',
@@ -1768,7 +1963,7 @@ const views={
  },
  custom(){
   return `<h2 class="h k">${t('customTitle')}</h2><p class="hint" style="margin-top:-6px">${t('customSub')}</p>
-   <label class="drop">${ico('up')}<input type="file" id="f" accept="application/pdf" onchange="pickFile(this.files[0])"><b>${t('dropT')}</b><small>${t('dropS')}</small></label>
+   <label class="drop">${ico('up')}<input type="file" id="f" onchange="pickFile(this.files[0])"><b>${t('dropT')}</b><small>${t('dropS')}</small></label>
    <div class="upst" id="upst">${upHTML()}</div>
    <div class="field"><label for="q">${t('qLabel')}</label><input class="inp" type="text" id="q" placeholder="${t('qPh')}" autocomplete="off" onkeydown="if(event.key==='Enter')doCustom()"></div>
    <button class="btn" id="go" onclick="doCustom()">${t('search')}</button><div id="out" aria-live="polite"></div>`;

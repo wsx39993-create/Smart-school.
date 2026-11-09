@@ -1,3 +1,4 @@
+import persist
 try:
     import control
 except ImportError:
